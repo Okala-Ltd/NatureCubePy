@@ -10,15 +10,33 @@ from __future__ import annotations
 
 import math
 import os
-import re
 from typing import Any
 
 import geopandas as gpd
 import httpx
 import pandas as pd
 
-_PROD_URL = "https://api.dashboard.okala.io/api/"
-_DEV_URL = "https://dev.api.dashboard.okala.io/api/"
+from naturecubepy.schema import (
+    AuthHeaders,
+    DataTypes,
+    GetProjectGeometryResponse,
+    IUCNSpeciesLabelInput,
+    Label,
+    LabelType,
+    MediaRecordAPIFlat,
+    MediaTimestampUpdate,
+    SegmentRecordAPIFlat,
+    SpeciesLight,
+    SpeciesTable,
+    StationResponseAPI,
+    TimestampUpdateResponse,
+    eDNAUploadResponse,
+    eDNAUploadSchema,
+)
+
+_PROD_URL = "https://naturecube.io/api/"
+_DEV_URL = "http://127.0.0.1:8000/api/"
+_DEFAULT_TIMEOUT = 60.0  # seconds
 
 
 def get_key() -> str:
@@ -50,7 +68,7 @@ def get_key() -> str:
 def auth_headers(
     api_key: str,
     okala_url: str = _PROD_URL,
-) -> dict[str, str]:
+) -> AuthHeaders:
     """Create an authentication context for the production Okala API.
 
     Parameters
@@ -62,22 +80,22 @@ def auth_headers(
 
     Returns
     -------
-    dict
-        A dict with keys ``"key"`` (the API key) and ``"root"`` (the base URL).
+    AuthHeaders
+        An AuthHeaders object with ``key`` and ``root`` attributes.
 
     Examples
     --------
     >>> hdr = auth_headers("mykey")
-    >>> hdr["root"]
-    'https://api.dashboard.okala.io/api/'
+    >>> hdr.root
+    'https://naturecube.io/api/'
     """
-    return {"key": api_key, "root": okala_url.rstrip("/") + "/"}
+    return AuthHeaders(key=api_key, root=okala_url.rstrip("/") + "/")
 
 
 def auth_headers_dev(
     api_key: str,
     okala_url: str = _DEV_URL,
-) -> dict[str, str]:
+) -> AuthHeaders:
     """Create an authentication context for the development Okala API.
 
     Parameters
@@ -89,48 +107,54 @@ def auth_headers_dev(
 
     Returns
     -------
-    dict
-        A dict with keys ``"key"`` (the API key) and ``"root"`` (the base URL).
+    AuthHeaders
+        An AuthHeaders object with ``key`` and ``root`` attributes.
 
     Examples
     --------
     >>> hdr = auth_headers_dev("mykey")
-    >>> hdr["root"]
-    'https://dev.api.dashboard.okala.io/api/'
+    >>> hdr.root
+    'http://127.0.0.1:8000/api/'
     """
-    return {"key": api_key, "root": okala_url.rstrip("/") + "/"}
+    return AuthHeaders(key=api_key, root=okala_url.rstrip("/") + "/")
 
 
-def get_project(hdr: dict[str, str]) -> None:
-    """Retrieve and display the active project name associated with the API key.
+def get_project(hdr: AuthHeaders, timeout: float = _DEFAULT_TIMEOUT) -> GetProjectGeometryResponse:
+    """Retrieve and display the active project associated with the API key.
 
     Parameters
     ----------
     hdr:
         Authentication context returned by :func:`auth_headers`.
+    timeout:
+        Request timeout in seconds. Defaults to 60.
 
     Returns
     -------
-    None
-        Prints a message with the active project name.
+    GetProjectGeometryResponse
+        The project geometry response containing boundary, ROIs, and locations.
 
     Examples
     --------
     >>> hdr = auth_headers("mykey")
-    >>> get_project(hdr)  # doctest: +SKIP
+    >>> project = get_project(hdr)  # doctest: +SKIP
     Setting your active project as - My Project
     """
-    url = f"{hdr['root']}getProject/{hdr['key']}"
-    response = httpx.get(url)
+    url = f"{hdr.root}getProject/{hdr.key}"
+    print("Retrieving project data...")
+    response = httpx.get(url, timeout=timeout)
+    print(f"Received response with status code {response.status_code}")
     response.raise_for_status()
     data = response.json()
+    print("Project data retrieved successfully")
     project_name = data["boundary"]["features"][0]["properties"]["project_name"]
     print(f"Setting your active project as - {project_name}")
+    return GetProjectGeometryResponse.model_validate(data)
 
 
 def get_station_info(
-    hdr: dict[str, str],
-    datatype: str,
+    hdr: AuthHeaders,
+    datatype: DataTypes,
 ) -> gpd.GeoDataFrame:
     """Retrieve all station metadata for a project.
 
@@ -151,10 +175,39 @@ def get_station_info(
     >>> hdr = auth_headers("mykey")
     >>> stations = get_station_info(hdr, "video")  # doctest: +SKIP
     """
-    url = f"{hdr['root']}getStations/{datatype}/{hdr['key']}"
-    response = httpx.get(url)
+    url = f"{hdr.root}getStations/{datatype}/{hdr.key}"
+    response = httpx.get(url, timeout=_DEFAULT_TIMEOUT)
     response.raise_for_status()
     return gpd.read_file(response.text)
+
+
+def get_stations_typed(
+    hdr: AuthHeaders,
+    datatype: DataTypes,
+) -> StationResponseAPI:
+    """Retrieve all station metadata for a project as a typed response.
+
+    Parameters
+    ----------
+    hdr:
+        Authentication context returned by :func:`auth_headers`.
+    datatype:
+        One of ``"video"``, ``"audio"``, ``"image"``, or ``"eDNA"``.
+
+    Returns
+    -------
+    StationResponseAPI
+        A typed response containing station features.
+
+    Examples
+    --------
+    >>> hdr = auth_headers("mykey")
+    >>> stations = get_stations_typed(hdr, "video")  # doctest: +SKIP
+    """
+    url = f"{hdr.root}getStations/{datatype}/{hdr.key}"
+    response = httpx.get(url, timeout=_DEFAULT_TIMEOUT)
+    response.raise_for_status()
+    return StationResponseAPI.model_validate(response.json())
 
 
 def plot_stations(geojson_response: gpd.GeoDataFrame) -> Any:
@@ -227,12 +280,12 @@ def plot_stations(geojson_response: gpd.GeoDataFrame) -> Any:
     return m
 
 
-def get_media_assets(
-    hdr: dict[str, str],
-    datatype: str,
-    psr_id: int,
-) -> pd.DataFrame:
-    """Retrieve media assets for a given project system record ID.
+def get_media_segments(
+    hdr: AuthHeaders,
+    datatype: DataTypes,
+    psr_ids: list[int],
+) -> list[SegmentRecordAPIFlat]:
+    """Retrieve media segments for given project system record IDs.
 
     Parameters
     ----------
@@ -240,28 +293,90 @@ def get_media_assets(
         Authentication context returned by :func:`auth_headers`.
     datatype:
         One of ``"video"``, ``"audio"``, ``"image"``, or ``"eDNA"``.
-    psr_id:
-        The unique project system record ID.
+    psr_ids:
+        List of project system record IDs.
+
+    Returns
+    -------
+    list[SegmentRecordAPIFlat]
+        A list of segment records.
+
+    Examples
+    --------
+    >>> segments = get_media_segments(hdr, "video", psr_ids=[123, 456])  # doctest: +SKIP
+    """
+    url = f"{hdr.root}getMediaSegments/{datatype}/{hdr.key}"
+    response = httpx.post(url, json=psr_ids, timeout=_DEFAULT_TIMEOUT)
+    response.raise_for_status()
+    return [SegmentRecordAPIFlat.model_validate(item) for item in response.json()]
+
+
+def get_media_assets(
+    hdr: AuthHeaders,
+    datatype: DataTypes,
+    psr_ids: list[int],
+) -> list[MediaRecordAPIFlat]:
+    """Retrieve media assets for given project system record IDs.
+
+    Parameters
+    ----------
+    hdr:
+        Authentication context returned by :func:`auth_headers`.
+    datatype:
+        One of ``"video"``, ``"audio"``, ``"image"``, or ``"eDNA"``.
+    psr_ids:
+        List of project system record IDs.
+
+    Returns
+    -------
+    list[MediaRecordAPIFlat]
+        A list of media records with full details.
+
+    Examples
+    --------
+    >>> assets = get_media_assets(hdr, "video", psr_ids=[123])  # doctest: +SKIP
+    """
+    url = f"{hdr.root}getMediaAssets/{datatype}/{hdr.key}"
+    response = httpx.post(url, json=psr_ids, timeout=_DEFAULT_TIMEOUT)
+    response.raise_for_status()
+    return [MediaRecordAPIFlat.model_validate(item) for item in response.json()]
+
+
+def get_media_assets_df(
+    hdr: AuthHeaders,
+    datatype: DataTypes,
+    psr_ids: list[int],
+) -> pd.DataFrame:
+    """Retrieve media assets as a DataFrame for given project system record IDs.
+
+    Parameters
+    ----------
+    hdr:
+        Authentication context returned by :func:`auth_headers`.
+    datatype:
+        One of ``"video"``, ``"audio"``, ``"image"``, or ``"eDNA"``.
+    psr_ids:
+        List of project system record IDs.
 
     Returns
     -------
     pandas.DataFrame
-        A DataFrame of media assets for the specified project system record.
+        A DataFrame of media assets.
 
     Examples
     --------
-    >>> assets = get_media_assets(hdr, "video", psr_id=123)  # doctest: +SKIP
+    >>> assets = get_media_assets_df(hdr, "video", psr_ids=[123])  # doctest: +SKIP
     """
-    url = f"{hdr['root']}getMediaAssets/{datatype}/{hdr['key']}"
-    response = httpx.post(url, json=psr_id)
+    url = f"{hdr.root}getMediaAssets/{datatype}/{hdr.key}"
+    response = httpx.post(url, json=psr_ids, timeout=_DEFAULT_TIMEOUT)
     response.raise_for_status()
     return pd.DataFrame(response.json())
 
 
 def get_project_labels(
-    hdr: dict[str, str],
-    labeltype: str,
-) -> pd.DataFrame:
+    hdr: AuthHeaders,
+    labeltype: LabelType,
+) -> list[SpeciesLight]:
     """Retrieve project-specific labels.
 
     Parameters
@@ -269,7 +384,35 @@ def get_project_labels(
     hdr:
         Authentication context returned by :func:`auth_headers`.
     labeltype:
-        Either ``"Bioacoustic"`` or ``"Camera"``.
+        Either ``"Bioacoustic"``, ``"Camera"``, or ``"Observation"``.
+
+    Returns
+    -------
+    list[SpeciesLight]
+        A list of project labels with species information.
+
+    Examples
+    --------
+    >>> labels = get_project_labels(hdr, "Camera")  # doctest: +SKIP
+    """
+    url = f"{hdr.root}getProjectLabels/{labeltype}/{hdr.key}"
+    response = httpx.get(url, timeout=_DEFAULT_TIMEOUT)
+    response.raise_for_status()
+    return [SpeciesLight.model_validate(item) for item in response.json()]
+
+
+def get_project_labels_df(
+    hdr: AuthHeaders,
+    labeltype: LabelType,
+) -> pd.DataFrame:
+    """Retrieve project-specific labels as a DataFrame.
+
+    Parameters
+    ----------
+    hdr:
+        Authentication context returned by :func:`auth_headers`.
+    labeltype:
+        Either ``"Bioacoustic"``, ``"Camera"``, or ``"Observation"``.
 
     Returns
     -------
@@ -278,19 +421,19 @@ def get_project_labels(
 
     Examples
     --------
-    >>> labels = get_project_labels(hdr, "Camera")  # doctest: +SKIP
+    >>> labels = get_project_labels_df(hdr, "Camera")  # doctest: +SKIP
     """
-    url = f"{hdr['root']}getProjectLabels/{labeltype}/{hdr['key']}"
-    response = httpx.get(url)
+    url = f"{hdr.root}getProjectLabels/{labeltype}/{hdr.key}"
+    response = httpx.get(url, timeout=_DEFAULT_TIMEOUT)
     response.raise_for_status()
     return pd.DataFrame(response.json())
 
 
 def add_project_labels(
-    hdr: dict[str, str],
-    labeltype: str,
-    labels: list[dict[str, Any]],
-) -> Any:
+    hdr: AuthHeaders,
+    labeltype: LabelType,
+    labels: list[Label],
+) -> dict[str, str]:
     """Add labels to the project.
 
     Parameters
@@ -298,31 +441,32 @@ def add_project_labels(
     hdr:
         Authentication context returned by :func:`auth_headers`.
     labeltype:
-        Either ``"Bioacoustic"`` or ``"Camera"``.
+        Either ``"Bioacoustic"``, ``"Camera"``, or ``"Observation"``.
     labels:
-        A list of label objects to add.
+        A list of Label objects to add.
 
     Returns
     -------
-    Any
-        The API response as a parsed JSON object.
+    dict[str, str]
+        A response message indicating success.
 
     Examples
     --------
-    >>> add_project_labels(hdr, "Camera", labels=[{...}])  # doctest: +SKIP
+    >>> add_project_labels(hdr, "Camera", labels=[Label(...)])  # doctest: +SKIP
     """
-    url = f"{hdr['root']}addProjectLabels/{labeltype}/{hdr['key']}"
-    response = httpx.post(url, json=labels)
+    url = f"{hdr.root}addProjectLabels/{labeltype}/{hdr.key}"
+    payload = [label.model_dump(mode="json") for label in labels]
+    response = httpx.post(url, json=payload, timeout=_DEFAULT_TIMEOUT)
     response.raise_for_status()
     return response.json()
 
 
 def get_iucn_labels(
-    hdr: dict[str, str],
+    hdr: AuthHeaders,
     offset: int,
     limit: int,
     search_term: str | None = None,
-) -> dict[str, Any]:
+) -> SpeciesTable:
     """Retrieve labels from the wider IUCN database.
 
     Parameters
@@ -338,9 +482,8 @@ def get_iucn_labels(
 
     Returns
     -------
-    dict
-        A dict with keys ``"data"`` (DataFrame), ``"total"``, ``"offset"``,
-        and ``"limit"``.
+    SpeciesTable
+        A SpeciesTable with ``table`` (list of SpeciesLight) and ``pagination_state``.
 
     Raises
     ------
@@ -359,28 +502,16 @@ def get_iucn_labels(
         "limit": limit,
         "search_term": search_term or "",
     }
-    url = f"{hdr['root']}getIUCNLabels/{hdr['key']}"
-    response = httpx.get(url, params=params)
+    url = f"{hdr.root}getIUCNLabels/{hdr.key}"
+    response = httpx.get(url, params=params, timeout=_DEFAULT_TIMEOUT)
     response.raise_for_status()
-    resp = response.json()
-
-    rows = resp.get("table", [])
-    cleaned = [{k: v for k, v in row.items() if v is not None} for row in rows]
-    data = pd.DataFrame(cleaned)
-
-    pagination = resp.get("pagination_state", {})
-    return {
-        "data": data,
-        "total": pagination.get("total"),
-        "offset": pagination.get("offset"),
-        "limit": pagination.get("limit"),
-    }
+    return SpeciesTable.model_validate(response.json())
 
 
 def add_iucn_labels(
-    hdr: dict[str, str],
-    labels: pd.DataFrame,
-    chunksize: int,
+    hdr: AuthHeaders,
+    labels: list[IUCNSpeciesLabelInput],
+    chunksize: int = 200,
 ) -> Any:
     """Add labels from the IUCN database in chunks.
 
@@ -389,7 +520,7 @@ def add_iucn_labels(
     hdr:
         Authentication context returned by :func:`auth_headers`.
     labels:
-        A DataFrame of labels to add.
+        A list of IUCNSpeciesLabelInput objects to add.
     chunksize:
         Number of records per submission chunk.
 
@@ -411,30 +542,52 @@ def add_iucn_labels(
             print(f"chunksize is bigger than length of data, altering chunksize to {n // 2}")
             chunksize = n // 2
         num_chunks = math.ceil(n / chunksize)
-        chunks = [labels.iloc[i * chunksize:(i + 1) * chunksize] for i in range(num_chunks)]
+        chunks = [labels[i * chunksize:(i + 1) * chunksize] for i in range(num_chunks)]
 
     resp = None
-    url = f"{hdr['root']}addIUCNLabels/{hdr['key']}"
+    url = f"{hdr.root}addIUCNLabels/{hdr.key}"
     for i, chunk in enumerate(chunks, start=1):
-        response = httpx.post(url, json=chunk.to_dict(orient="records"))
+        payload = [label.model_dump(mode="json", by_alias=True) for label in chunk]
+        response = httpx.post(url, json=payload, timeout=_DEFAULT_TIMEOUT)
         response.raise_for_status()
         resp = response.json()
-        print(f"submitted {i * chunksize} labels of {n}")
+        print(f"submitted {min(i * chunksize, n)} labels of {n}")
 
     return resp
 
 
-def _send_updated_labels(hdr: dict[str, str], data_chunk: pd.DataFrame) -> Any:
-    """Internal helper: send a single chunk of updated segment labels."""
-    url = f"{hdr['root']}updateSegmentLabels/{hdr['key']}"
-    response = httpx.put(url, json=data_chunk.to_dict(orient="records"))
+def update_segment_labels(
+    hdr: AuthHeaders,
+    labels: list[Label],
+) -> dict[str, str]:
+    """Update segment labels.
+
+    Parameters
+    ----------
+    hdr:
+        Authentication context returned by :func:`auth_headers`.
+    labels:
+        A list of Label objects with updated information.
+
+    Returns
+    -------
+    dict[str, str]
+        A response message indicating success.
+
+    Examples
+    --------
+    >>> update_segment_labels(hdr, labels)  # doctest: +SKIP
+    """
+    url = f"{hdr.root}updateSegmentLabels/{hdr.key}"
+    payload = [label.model_dump(mode="json") for label in labels]
+    response = httpx.put(url, json=payload, timeout=_DEFAULT_TIMEOUT)
     response.raise_for_status()
     return response.json()
 
 
 def push_new_labels(
-    hdr: dict[str, str],
-    submission_records: pd.DataFrame,
+    hdr: AuthHeaders,
+    submission_records: list[Label],
     chunksize: int,
 ) -> None:
     """Push new segment labels to the platform in chunks.
@@ -444,7 +597,7 @@ def push_new_labels(
     hdr:
         Authentication context returned by :func:`auth_headers`.
     submission_records:
-        A DataFrame containing the records to submit.
+        A list of Label objects to submit.
     chunksize:
         Number of records per chunk.
 
@@ -459,99 +612,48 @@ def push_new_labels(
 
     num_chunks = math.ceil(n / chunksize)
     for i in range(num_chunks):
-        chunk = submission_records.iloc[i * chunksize:(i + 1) * chunksize]
-        _send_updated_labels(hdr, chunk)
+        chunk = submission_records[i * chunksize:(i + 1) * chunksize]
+        update_segment_labels(hdr, chunk)
         print(f"submitted {min((i + 1) * chunksize, n)} labels of {n}")
 
 
-def _send_media_chunk(hdr: dict[str, str], data_chunk: pd.DataFrame) -> Any:
-    """Internal helper: send a single chunk of timestamp updates."""
-    url = f"{hdr['root']}updateTimestamps/{hdr['key']}"
-    response = httpx.put(url, json=data_chunk.to_dict(orient="records"))
-    response.raise_for_status()
-    return response.json()
-
-
-_ISO8601_PATTERN = re.compile(
-    r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(Z|[+-]\d{2}:?\d{2})?$"
-)
-
-
 def update_media_timestamps(
-    hdr: dict[str, str],
-    media_records: pd.DataFrame,
-) -> Any:
-    """Update timestamps for one or more media file records in a single API call.
-
-    For large datasets (>1000 records) consider using :func:`push_new_timestamps`
-    which handles chunking automatically.
+    hdr: AuthHeaders,
+    media_records: list[MediaTimestampUpdate],
+) -> list[TimestampUpdateResponse]:
+    """Update timestamps for one or more media file records.
 
     Parameters
     ----------
     hdr:
         Authentication context returned by :func:`auth_headers`.
     media_records:
-        A DataFrame with columns ``media_file_record_id`` (int) and
-        ``new_timestamp`` (ISO 8601 string, e.g. ``"2024-01-15T10:30:00Z"``).
+        A list of MediaTimestampUpdate objects with ``media_file_record_id``
+        and ``new_timestamp``.
 
     Returns
     -------
-    Any
-        The API response as a parsed JSON object.
-
-    Raises
-    ------
-    ValueError
-        If required columns are missing or values are invalid.
+    list[TimestampUpdateResponse]
+        A list of responses indicating success for each update.
 
     Examples
     --------
-    >>> import pandas as pd
-    >>> updates = pd.DataFrame({
-    ...     "media_file_record_id": [123, 456],
-    ...     "new_timestamp": ["2024-01-15T10:30:00Z", "2024-01-15T14:20:00Z"],
-    ... })
+    >>> from datetime import datetime
+    >>> updates = [MediaTimestampUpdate(media_file_record_id=123, new_timestamp=datetime.now())]
     >>> result = update_media_timestamps(hdr, updates)  # doctest: +SKIP
     """
-    required_cols = {"media_file_record_id", "new_timestamp"}
-    missing = required_cols - set(media_records.columns)
-    if missing:
-        raise ValueError(f"Missing required columns: {', '.join(sorted(missing))}")
-
-    if not pd.api.types.is_numeric_dtype(media_records["media_file_record_id"]):
-        raise ValueError("media_file_record_id must be numeric")
-    if media_records["media_file_record_id"].isna().any():
-        raise ValueError("media_file_record_id cannot contain NA values")
-    if (media_records["media_file_record_id"] <= 0).any():
-        raise ValueError("media_file_record_id must be positive")
-    if (media_records["media_file_record_id"] % 1 != 0).any():
-        raise ValueError("media_file_record_id must be an integer")
-
-    if not pd.api.types.is_string_dtype(media_records["new_timestamp"]):
-        raise ValueError("new_timestamp must be a string in ISO 8601 format")
-
-    invalid_mask = media_records["new_timestamp"].notna() & ~media_records["new_timestamp"].str.match(
-        r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(Z|[+-]\d{2}:?\d{2})?$"
-    )
-    if invalid_mask.any():
-        invalid_rows = list(media_records.index[invalid_mask] + 1)
-        raise ValueError(
-            "new_timestamp must be in ISO 8601 format, e.g. '2024-01-31T23:59:59Z'. "
-            f"Invalid values at row(s): {invalid_rows}"
-        )
-
-    subset = media_records[list(required_cols)].copy()
-    url = f"{hdr['root']}updateTimestamps/{hdr['key']}"
-    response = httpx.put(url, json=subset.to_dict(orient="records"))
+    url = f"{hdr.root}updateTimestamps/{hdr.key}"
+    payload = [record.model_dump(mode="json") for record in media_records]
+    response = httpx.put(url, json=payload, timeout=_DEFAULT_TIMEOUT)
     response.raise_for_status()
-    result = response.json()
-    print(f"Successfully updated {len(subset)} media timestamp(s)")
+    result = [TimestampUpdateResponse.model_validate(item) for item in response.json()]
+    print(f"Successfully updated {len(result)} media timestamp(s)")
     return result
 
 
 def push_new_timestamps(
-    hdr: dict[str, str],
-    media_metadata: pd.DataFrame,
+    hdr: AuthHeaders,
+    media_metadata: list[MediaTimestampUpdate],
     chunksize: int,
 ) -> None:
     """Update timestamps for multiple media records by splitting into chunks.
@@ -563,7 +665,7 @@ def push_new_timestamps(
     hdr:
         Authentication context returned by :func:`auth_headers`.
     media_metadata:
-        A DataFrame with columns ``media_file_record_id`` and ``new_timestamp``.
+        A list of MediaTimestampUpdate objects.
     chunksize:
         Number of records per chunk. Recommended: 50–200.
 
@@ -578,16 +680,16 @@ def push_new_timestamps(
 
     num_chunks = math.ceil(n / chunksize)
     for i in range(num_chunks):
-        chunk = media_metadata.iloc[i * chunksize:(i + 1) * chunksize]
-        _send_media_chunk(hdr, chunk)
+        chunk = media_metadata[i * chunksize:(i + 1) * chunksize]
+        update_media_timestamps(hdr, chunk)
         print(f"submitted {min((i + 1) * chunksize, n)} timestamps of {n}")
 
 
 def set_segment_blank_status(
-    hdr: dict[str, str],
+    hdr: AuthHeaders,
     blank_status: bool,
     segment_record_ids: list[int],
-) -> Any:
+) -> dict[str, str]:
     """Mark or unmark segment labels as blank.
 
     Parameters
@@ -601,16 +703,16 @@ def set_segment_blank_status(
 
     Returns
     -------
-    Any
-        The API response as a parsed JSON object.
+    dict[str, str]
+        A response message indicating success.
 
     Examples
     --------
     >>> set_segment_blank_status(hdr, blank_status=True, segment_record_ids=[101, 102])  # doctest: +SKIP
     """
     status_str = str(blank_status).lower()
-    url = f"{hdr['root']}segmentLabelsBlankStatus/{hdr['key']}/{status_str}"
-    response = httpx.put(url, json=segment_record_ids)
+    url = f"{hdr.root}segmentLabelsBlankStatus/{hdr.key}/{status_str}"
+    response = httpx.put(url, json=segment_record_ids, timeout=_DEFAULT_TIMEOUT)
     response.raise_for_status()
     resp = response.json()
     print(resp.get("message", ""))
@@ -618,13 +720,44 @@ def set_segment_blank_status(
 
 
 def check_edna_labels(
-    hdr: dict[str, str],
-    edna_data: pd.DataFrame,
-) -> pd.DataFrame:
+    hdr: AuthHeaders,
+    edna_data: list[eDNAUploadSchema],
+) -> list[eDNAUploadResponse]:
     """Validate eDNA records against the Okala database.
 
     Uses a hierarchical taxonomy approach:
     species → genus → family → order → class → phylum → kingdom.
+
+    Parameters
+    ----------
+    hdr:
+        Authentication context returned by :func:`auth_headers`.
+    edna_data:
+        A list of eDNAUploadSchema objects with eDNA records.
+
+    Returns
+    -------
+    list[eDNAUploadResponse]
+        The validated records with ``label``, ``label_id``, ``status``, and ``message``.
+
+    Examples
+    --------
+    >>> validated = check_edna_labels(hdr, edna_records)  # doctest: +SKIP
+    """
+    url = f"{hdr.root}checkeDNALabels/{hdr.key}"
+    payload = [record.model_dump(mode="json", by_alias=True) for record in edna_data]
+    response = httpx.post(url, json=payload, timeout=_DEFAULT_TIMEOUT)
+    response.raise_for_status()
+    result = [eDNAUploadResponse.model_validate(item) for item in response.json()]
+    print(f"Validated {len(result)} eDNA records")
+    return result
+
+
+def check_edna_labels_df(
+    hdr: AuthHeaders,
+    edna_data: pd.DataFrame,
+) -> pd.DataFrame:
+    """Validate eDNA records from a DataFrame against the Okala database.
 
     Parameters
     ----------
@@ -649,7 +782,7 @@ def check_edna_labels(
 
     Examples
     --------
-    >>> validated = check_edna_labels(hdr, edna_records)  # doctest: +SKIP
+    >>> validated = check_edna_labels_df(hdr, edna_records)  # doctest: +SKIP
     """
     required_cols = {"marker_name", "sequence", "primer", "timestamp"}
     missing = required_cols - set(edna_data.columns)
@@ -671,8 +804,8 @@ def check_edna_labels(
         for row in data.to_dict(orient="records")
     ]
 
-    url = f"{hdr['root']}checkeDNALabels/{hdr['key']}"
-    response = httpx.post(url, json=records)
+    url = f"{hdr.root}checkeDNALabels/{hdr.key}"
+    response = httpx.post(url, json=records, timeout=_DEFAULT_TIMEOUT)
     response.raise_for_status()
     result = pd.DataFrame(response.json())
     print(f"Validated {len(result)} eDNA records")
@@ -680,57 +813,49 @@ def check_edna_labels(
 
 
 def upload_edna_records(
-    hdr: dict[str, str],
-    validated_data: pd.DataFrame,
+    hdr: AuthHeaders,
+    validated_data: list[eDNAUploadResponse],
     project_system_record_id: int,
-) -> pd.DataFrame:
+) -> list[eDNAUploadResponse]:
     """Upload validated eDNA records to a project system record.
 
-    Only records with ``status == "success"`` (from :func:`check_edna_labels`)
-    are uploaded.
+    Only records with ``status == "success"`` will be uploaded.
 
     Parameters
     ----------
     hdr:
         Authentication context returned by :func:`auth_headers`.
     validated_data:
-        A DataFrame of validated eDNA records from :func:`check_edna_labels`.
+        A list of validated eDNAUploadResponse objects from :func:`check_edna_labels`.
     project_system_record_id:
         The project system record ID to upload records to.
 
     Returns
     -------
-    pandas.DataFrame
-        A DataFrame with the upload response for each record.
+    list[eDNAUploadResponse]
+        A list of responses for each uploaded record.
 
     Raises
     ------
     ValueError
-        If the data has not been validated or no successful records exist.
+        If no successful records exist.
 
     Examples
     --------
     >>> validated = check_edna_labels(hdr, edna_records)  # doctest: +SKIP
     >>> result = upload_edna_records(hdr, validated, project_system_record_id=123)  # doctest: +SKIP
     """
-    if "status" not in validated_data.columns:
-        raise ValueError("Data must be validated first using check_edna_labels()")
-
-    successful = validated_data[validated_data["status"] == "success"]
+    successful = [r for r in validated_data if r.status == "success"]
 
     if len(successful) == 0:
         raise ValueError("No successful records to upload. All records failed validation.")
 
     print(f"Uploading {len(successful)} validated eDNA records")
 
-    records = [
-        {k: v for k, v in row.items() if pd.notna(v)}
-        for row in successful.to_dict(orient="records")
-    ]
-
-    url = f"{hdr['root']}uploadeDNA/{hdr['key']}/{project_system_record_id}"
-    response = httpx.post(url, json=records)
+    url = f"{hdr.root}uploadeDNA/{hdr.key}/{project_system_record_id}"
+    payload = [record.model_dump(mode="json", by_alias=True) for record in successful]
+    response = httpx.post(url, json=payload, timeout=_DEFAULT_TIMEOUT)
     response.raise_for_status()
-    result = pd.DataFrame(response.json())
+    result = [eDNAUploadResponse.model_validate(item) for item in response.json()]
     print(f"Upload complete: {len(result)} records processed")
     return result
