@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import math
 import os
-from typing import Any
+from typing import Any, Literal
 
 import geopandas as gpd
 import httpx
@@ -18,6 +18,7 @@ import pandas as pd
 
 from naturecubepy.schema import (
     AuthHeaders,
+    CameraTrapDataRecord,
     DataTypes,
     GetProjectGeometryResponse,
     IUCNSpeciesLabelInput,
@@ -345,7 +346,7 @@ def get_media_assets(
 def get_media_assets_df(
     hdr: AuthHeaders,
     datatype: DataTypes,
-    psr_ids: list[int],
+    project_system_record_ids: int | list[int],
 ) -> pd.DataFrame:
     """Retrieve media assets as a DataFrame for given project system record IDs.
 
@@ -355,8 +356,8 @@ def get_media_assets_df(
         Authentication context returned by :func:`auth_headers`.
     datatype:
         One of ``"video"``, ``"audio"``, ``"image"``, or ``"eDNA"``.
-    psr_ids:
-        List of project system record IDs.
+    project_system_record_ids:
+        A project system record ID or a list of IDs.
 
     Returns
     -------
@@ -365,14 +366,12 @@ def get_media_assets_df(
 
     Examples
     --------
-    >>> assets = get_media_assets_df(hdr, "video", psr_ids=[123])  # doctest: +SKIP
+    >>> assets = get_media_assets_df(hdr, "video", project_system_record_ids=123)  # doctest: +SKIP
+    >>> assets = get_media_assets_df(hdr, "video", project_system_record_ids=[123, 456])  # doctest: +SKIP
     """
-    url = f"{hdr['root']}getMediaAssets/{datatype}/{hdr['key']}"
-    payload = _normalise_project_system_record_ids(
-        project_system_record_ids,
-        psr_id=psr_id,
-    )
-    response = httpx.post(url, json=payload)
+    url = f"{hdr.root}getMediaAssets/{datatype}/{hdr.key}"
+    payload = _normalise_project_system_record_ids(project_system_record_ids)
+    response = httpx.post(url, json=payload, timeout=_DEFAULT_TIMEOUT)
     try:
         response.raise_for_status()
     except Exception as e:
@@ -382,22 +381,13 @@ def get_media_assets_df(
 
 
 def _normalise_project_system_record_ids(
-    project_system_record_ids: int | list[int] | None,
-    *,
-    psr_id: int | None = None,
+    project_system_record_ids: int | list[int],
 ) -> list[int]:
     """Normalise project system record ID inputs to the API's list format."""
-    if project_system_record_ids is None and psr_id is None:
-        raise ValueError("project_system_record_ids or psr_id must be provided")
-    if project_system_record_ids is not None and psr_id is not None:
-        raise ValueError("Provide either project_system_record_ids or psr_id, not both")
-
-    raw_ids = psr_id if psr_id is not None else project_system_record_ids
-
-    if isinstance(raw_ids, int):
-        record_ids = [raw_ids]
+    if isinstance(project_system_record_ids, int):
+        record_ids = [project_system_record_ids]
     else:
-        record_ids = list(raw_ids)
+        record_ids = list(project_system_record_ids)
 
     if not record_ids:
         raise ValueError("project_system_record_ids must contain at least one ID")
@@ -414,11 +404,9 @@ def _normalise_project_system_record_ids(
 
 
 def get_media_segments(
-    hdr: dict[str, str],
-    datatype: str,
-    project_system_record_ids: int | list[int] | None = None,
-    *,
-    psr_id: int | None = None,
+    hdr: AuthHeaders,
+    datatype: DataTypes,
+    project_system_record_ids: int | list[int],
 ) -> pd.DataFrame:
     """Retrieve media segments for one or more project system record IDs.
 
@@ -427,11 +415,9 @@ def get_media_segments(
     hdr:
         Authentication context returned by :func:`auth_headers`.
     datatype:
-        One of ``"video"``, ``"audio"``, or ``"image"``.
+        One of ``"video"``, ``"audio"``, ``"image"``, or ``"eDNA"``.
     project_system_record_ids:
         A project system record ID or a list of IDs.
-    psr_id:
-        Backwards-compatible alias for a single project system record ID.
 
     Returns
     -------
@@ -440,14 +426,11 @@ def get_media_segments(
 
     Examples
     --------
-    >>> segments = get_media_segments(hdr, "audio", psr_id=123)  # doctest: +SKIP
+    >>> segments = get_media_segments(hdr, "audio", project_system_record_ids=123)  # doctest: +SKIP
     >>> segments = get_media_segments(hdr, "audio", project_system_record_ids=[123, 456])  # doctest: +SKIP
     """
-    url = f"{hdr['root']}getMediaSegments/{datatype}/{hdr['key']}"
-    payload = _normalise_project_system_record_ids(
-        project_system_record_ids,
-        psr_id=psr_id,
-    )
+    url = f"{hdr.root}getMediaSegments/{datatype}/{hdr.key}"
+    payload = _normalise_project_system_record_ids(project_system_record_ids)
     response = httpx.post(
         url,
         json=payload,
@@ -456,8 +439,160 @@ def get_media_segments(
     return pd.DataFrame(response.json())
 
 
+def _camera_trap_datatypes(datatype: Literal["image", "video", "both"] = "both") -> list[Literal["image", "video"]]:
+    """Normalise camera trap datatype input to the supported image/video list."""
+    if datatype == "both":
+        return ["image", "video"]
+    return [datatype]
+
+
+def _build_camera_trap_station_lookup(
+    stations: gpd.GeoDataFrame,
+    datatype: Literal["image", "video"],
+) -> pd.DataFrame:
+    """Build a station lookup table with stable camera trap metadata."""
+    if "project_system_record_id" not in stations.columns:
+        raise ValueError(
+            "Station data does not contain 'project_system_record_id' column. "
+            "Cannot link media assets to stations."
+        )
+
+    lookup = stations.dropna(subset=["project_system_record_id"]).copy()
+    if lookup.empty:
+        return pd.DataFrame(
+            columns=[
+                "project_system_record_id",
+                "device_id",
+                "data_type",
+                "measurement_type",
+                "latitude",
+                "longitude",
+            ]
+        )
+
+    lookup["project_system_record_id"] = lookup["project_system_record_id"].astype(int)
+    lookup["latitude"] = lookup.geometry.y
+    lookup["longitude"] = lookup.geometry.x
+    if "data_type" not in lookup.columns:
+        lookup["data_type"] = datatype
+
+    selected_columns = [
+        "project_system_record_id",
+        "device_id",
+        "data_type",
+        "measurement_type",
+        "latitude",
+        "longitude",
+    ]
+    available_columns = [column for column in selected_columns if column in lookup.columns]
+    return lookup[available_columns].drop_duplicates(subset=["project_system_record_id"])
+
+
+def get_camera_trap_data(
+    hdr: AuthHeaders,
+    datatype: Literal["image", "video", "both"] = "both",
+) -> pd.DataFrame:
+    """Retrieve merged camera trap media rows for image and video stations.
+
+    The returned DataFrame combines station metadata, media assets, and media
+    segments while avoiding duplicate merge columns. By default, both image and
+    video camera trap data are returned together.
+
+    Parameters
+    ----------
+    hdr:
+        Authentication context returned by :func:`auth_headers`.
+    datatype:
+        ``"image"``, ``"video"``, or ``"both"``. Defaults to ``"both"``.
+
+    Returns
+    -------
+    pandas.DataFrame
+        A validated DataFrame containing merged camera trap media rows.
+
+    Examples
+    --------
+    >>> df = get_camera_trap_data(hdr)  # doctest: +SKIP
+    >>> sorted(df["data_type"].unique())  # doctest: +SKIP
+    ['image', 'video']
+    """
+    frames: list[pd.DataFrame] = []
+
+    for current_datatype in _camera_trap_datatypes(datatype):
+        stations = get_station_info(hdr, current_datatype)
+        station_lookup = _build_camera_trap_station_lookup(stations, current_datatype)
+        if station_lookup.empty:
+            continue
+
+        psr_ids = station_lookup["project_system_record_id"].tolist()
+        media_df = get_media_assets_df(hdr, current_datatype, project_system_record_ids=psr_ids)
+        if media_df.empty:
+            continue
+
+        if "project_system_record_id" not in media_df.columns and "project_system_record_id_fk" in media_df.columns:
+            media_df["project_system_record_id"] = media_df["project_system_record_id_fk"]
+
+        if "project_system_record_id" not in media_df.columns:
+            raise ValueError(
+                "Media asset data does not contain a project system record identifier. "
+                "Expected 'project_system_record_id' or 'project_system_record_id_fk'."
+            )
+
+        media_df["project_system_record_id"] = pd.to_numeric(
+            media_df["project_system_record_id"],
+            errors="raise",
+        ).astype(int)
+
+        segments_df = get_media_segments(hdr, current_datatype, project_system_record_ids=psr_ids)
+        merged_df = media_df.copy()
+
+        if not segments_df.empty:
+            segment_merge_columns = [
+                column
+                for column in segments_df.columns
+                if column == "segment_record_id" or column not in merged_df.columns
+            ]
+            merged_df = merged_df.merge(
+                segments_df[segment_merge_columns].drop_duplicates(subset=["segment_record_id"]),
+                on="segment_record_id",
+                how="left",
+            )
+
+        station_merge_columns = ["project_system_record_id"] + [
+            column for column in station_lookup.columns if column not in merged_df.columns
+        ]
+        merged_df = merged_df.merge(
+            station_lookup[station_merge_columns],
+            on="project_system_record_id",
+            how="left",
+        )
+
+        if "data_type" not in merged_df.columns:
+            merged_df["data_type"] = current_datatype
+
+        validated_rows = [
+            CameraTrapDataRecord.model_validate(row).model_dump(mode="json", by_alias=True)
+            for row in merged_df.to_dict(orient="records")
+        ]
+        frames.append(pd.DataFrame(validated_rows))
+
+    if not frames:
+        return pd.DataFrame(
+            columns=[
+                "project_system_record_id",
+                "device_id",
+                "data_type",
+                "measurement_type",
+                "latitude",
+                "longitude",
+            ]
+        )
+
+    return pd.concat(frames, ignore_index=True, sort=False)
+
+
 def get_edna_assets(
-    hdr: dict[str, str],
+    hdr: AuthHeaders,
     project_system_record_id: int,
 ) -> pd.DataFrame:
     """Retrieve eDNA assets for a project system record ID.
@@ -482,7 +617,7 @@ def get_edna_assets(
     if project_system_record_id <= 0:
         raise ValueError("project_system_record_id must be a positive integer")
 
-    url = f"{hdr['root']}geteDNAAssets/{project_system_record_id}/{hdr['key']}"
+    url = f"{hdr.root}geteDNAAssets/{project_system_record_id}/{hdr.key}"
     response = httpx.get(url)
     response.raise_for_status()
     return pd.DataFrame(response.json())

@@ -246,6 +246,19 @@ class SegmentRecordAPIFlat(MediaRecordSimple, SegmentSimple):
         return values
 
 
+class CameraTrapDataRecord(BaseModel):
+    """Merged camera trap row with validated core fields."""
+
+    model_config = ConfigDict(extra="allow", populate_by_name=True)
+
+    project_system_record_id: int
+    data_type: Literal["image", "video"]
+    device_id: str | None = None
+    measurement_type: MeasurementType | None = None
+    latitude: float | None = None
+    longitude: float | None = None
+
+
 # ============================================================
 # Timestamp Update Schemas
 # ============================================================
