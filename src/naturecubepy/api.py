@@ -230,9 +230,11 @@ def plot_stations(geojson_response: gpd.GeoDataFrame) -> Any:
 def get_media_assets(
     hdr: dict[str, str],
     datatype: str,
-    psr_id: int,
+    project_system_record_ids: int | list[int] | None = None,
+    *,
+    psr_id: int | None = None,
 ) -> pd.DataFrame:
-    """Retrieve media assets for a given project system record ID.
+    """Retrieve media assets for one or more project system record IDs.
 
     Parameters
     ----------
@@ -240,20 +242,138 @@ def get_media_assets(
         Authentication context returned by :func:`auth_headers`.
     datatype:
         One of ``"video"``, ``"audio"``, ``"image"``, or ``"eDNA"``.
+    project_system_record_ids:
+        A project system record ID or a list of IDs.
     psr_id:
-        The unique project system record ID.
+        Backwards-compatible alias for a single project system record ID.
 
     Returns
     -------
     pandas.DataFrame
-        A DataFrame of media assets for the specified project system record.
+        A DataFrame of media assets for the specified project system records.
 
     Examples
     --------
     >>> assets = get_media_assets(hdr, "video", psr_id=123)  # doctest: +SKIP
+    >>> assets = get_media_assets(hdr, "video", project_system_record_ids=[123, 456])  # doctest: +SKIP
     """
     url = f"{hdr['root']}getMediaAssets/{datatype}/{hdr['key']}"
-    response = httpx.post(url, json=psr_id)
+    payload = _normalise_project_system_record_ids(
+        project_system_record_ids,
+        psr_id=psr_id,
+    )
+    response = httpx.post(url, json=payload)
+    try:
+        response.raise_for_status()
+    except Exception as e:
+        print(f"Error fetching media assets: {e}\nPayload: {payload}\nResponse: {response.text}")
+        raise
+    return pd.DataFrame(response.json())
+
+
+def _normalise_project_system_record_ids(
+    project_system_record_ids: int | list[int] | None,
+    *,
+    psr_id: int | None = None,
+) -> list[int]:
+    """Normalise project system record ID inputs to the API's list format."""
+    if project_system_record_ids is None and psr_id is None:
+        raise ValueError("project_system_record_ids or psr_id must be provided")
+    if project_system_record_ids is not None and psr_id is not None:
+        raise ValueError("Provide either project_system_record_ids or psr_id, not both")
+
+    raw_ids = psr_id if psr_id is not None else project_system_record_ids
+
+    if isinstance(raw_ids, int):
+        record_ids = [raw_ids]
+    else:
+        record_ids = list(raw_ids)
+
+    if not record_ids:
+        raise ValueError("project_system_record_ids must contain at least one ID")
+
+    try:
+        normalised = [int(record_id) for record_id in record_ids]
+    except (TypeError, ValueError) as exc:
+        raise ValueError("project_system_record_ids must contain integers") from exc
+
+    if any(record_id <= 0 for record_id in normalised):
+        raise ValueError("project_system_record_ids must contain positive integers")
+
+    return normalised
+
+
+def get_media_segments(
+    hdr: dict[str, str],
+    datatype: str,
+    project_system_record_ids: int | list[int] | None = None,
+    *,
+    psr_id: int | None = None,
+) -> pd.DataFrame:
+    """Retrieve media segments for one or more project system record IDs.
+
+    Parameters
+    ----------
+    hdr:
+        Authentication context returned by :func:`auth_headers`.
+    datatype:
+        One of ``"video"``, ``"audio"``, or ``"image"``.
+    project_system_record_ids:
+        A project system record ID or a list of IDs.
+    psr_id:
+        Backwards-compatible alias for a single project system record ID.
+
+    Returns
+    -------
+    pandas.DataFrame
+        A DataFrame of media segments for the specified project system records.
+
+    Examples
+    --------
+    >>> segments = get_media_segments(hdr, "audio", psr_id=123)  # doctest: +SKIP
+    >>> segments = get_media_segments(hdr, "audio", project_system_record_ids=[123, 456])  # doctest: +SKIP
+    """
+    url = f"{hdr['root']}getMediaSegments/{datatype}/{hdr['key']}"
+    payload = _normalise_project_system_record_ids(
+        project_system_record_ids,
+        psr_id=psr_id,
+    )
+    response = httpx.post(
+        url,
+        json=payload,
+    )
+    response.raise_for_status()
+    return pd.DataFrame(response.json())
+
+
+def get_edna_assets(
+    hdr: dict[str, str],
+    project_system_record_id: int,
+) -> pd.DataFrame:
+    """Retrieve eDNA assets for a project system record ID.
+
+    Parameters
+    ----------
+    hdr:
+        Authentication context returned by :func:`auth_headers`.
+    project_system_record_id:
+        The project system record ID.
+
+    Returns
+    -------
+    pandas.DataFrame
+        A DataFrame of eDNA assets for the specified project system record.
+
+    Examples
+    --------
+    >>> assets = get_edna_assets(hdr, project_system_record_id=123)  # doctest: +SKIP
+    """
+    project_system_record_id = int(project_system_record_id)
+    if project_system_record_id <= 0:
+        raise ValueError("project_system_record_id must be a positive integer")
+
+    url = f"{hdr['root']}geteDNAAssets/{project_system_record_id}/{hdr['key']}"
+    response = httpx.get(url)
     response.raise_for_status()
     return pd.DataFrame(response.json())
 
