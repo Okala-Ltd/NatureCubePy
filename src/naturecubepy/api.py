@@ -36,6 +36,7 @@ from naturecubepy.schema import (
 
 _PROD_URL = "https://naturecube.io/api/"
 _DEV_URL = "http://127.0.0.1:8000/api/"
+_DEFAULT_TIMEOUT = 60.0  # seconds
 
 
 def get_key() -> str:
@@ -118,13 +119,15 @@ def auth_headers_dev(
     return AuthHeaders(key=api_key, root=okala_url.rstrip("/") + "/")
 
 
-def get_project(hdr: AuthHeaders) -> GetProjectGeometryResponse:
+def get_project(hdr: AuthHeaders, timeout: float = _DEFAULT_TIMEOUT) -> GetProjectGeometryResponse:
     """Retrieve and display the active project associated with the API key.
 
     Parameters
     ----------
     hdr:
         Authentication context returned by :func:`auth_headers`.
+    timeout:
+        Request timeout in seconds. Defaults to 60.
 
     Returns
     -------
@@ -138,7 +141,9 @@ def get_project(hdr: AuthHeaders) -> GetProjectGeometryResponse:
     Setting your active project as - My Project
     """
     url = f"{hdr.root}getProject/{hdr.key}"
-    response = httpx.get(url)
+    print("Retrieving project data...")
+    response = httpx.get(url, timeout=timeout)
+    print(f"Received response with status code {response.status_code}")
     response.raise_for_status()
     data = response.json()
     print("Project data retrieved successfully")
@@ -171,7 +176,7 @@ def get_station_info(
     >>> stations = get_station_info(hdr, "video")  # doctest: +SKIP
     """
     url = f"{hdr.root}getStations/{datatype}/{hdr.key}"
-    response = httpx.get(url)
+    response = httpx.get(url, timeout=_DEFAULT_TIMEOUT)
     response.raise_for_status()
     return gpd.read_file(response.text)
 
@@ -200,7 +205,7 @@ def get_stations_typed(
     >>> stations = get_stations_typed(hdr, "video")  # doctest: +SKIP
     """
     url = f"{hdr.root}getStations/{datatype}/{hdr.key}"
-    response = httpx.get(url)
+    response = httpx.get(url, timeout=_DEFAULT_TIMEOUT)
     response.raise_for_status()
     return StationResponseAPI.model_validate(response.json())
 
@@ -301,7 +306,7 @@ def get_media_segments(
     >>> segments = get_media_segments(hdr, "video", psr_ids=[123, 456])  # doctest: +SKIP
     """
     url = f"{hdr.root}getMediaSegments/{datatype}/{hdr.key}"
-    response = httpx.post(url, json=psr_ids)
+    response = httpx.post(url, json=psr_ids, timeout=_DEFAULT_TIMEOUT)
     response.raise_for_status()
     return [SegmentRecordAPIFlat.model_validate(item) for item in response.json()]
 
@@ -332,7 +337,7 @@ def get_media_assets(
     >>> assets = get_media_assets(hdr, "video", psr_ids=[123])  # doctest: +SKIP
     """
     url = f"{hdr.root}getMediaAssets/{datatype}/{hdr.key}"
-    response = httpx.post(url, json=psr_ids)
+    response = httpx.post(url, json=psr_ids, timeout=_DEFAULT_TIMEOUT)
     response.raise_for_status()
     return [MediaRecordAPIFlat.model_validate(item) for item in response.json()]
 
@@ -363,7 +368,7 @@ def get_media_assets_df(
     >>> assets = get_media_assets_df(hdr, "video", psr_ids=[123])  # doctest: +SKIP
     """
     url = f"{hdr.root}getMediaAssets/{datatype}/{hdr.key}"
-    response = httpx.post(url, json=psr_ids)
+    response = httpx.post(url, json=psr_ids, timeout=_DEFAULT_TIMEOUT)
     response.raise_for_status()
     return pd.DataFrame(response.json())
 
@@ -391,7 +396,7 @@ def get_project_labels(
     >>> labels = get_project_labels(hdr, "Camera")  # doctest: +SKIP
     """
     url = f"{hdr.root}getProjectLabels/{labeltype}/{hdr.key}"
-    response = httpx.get(url)
+    response = httpx.get(url, timeout=_DEFAULT_TIMEOUT)
     response.raise_for_status()
     return [SpeciesLight.model_validate(item) for item in response.json()]
 
@@ -419,7 +424,7 @@ def get_project_labels_df(
     >>> labels = get_project_labels_df(hdr, "Camera")  # doctest: +SKIP
     """
     url = f"{hdr.root}getProjectLabels/{labeltype}/{hdr.key}"
-    response = httpx.get(url)
+    response = httpx.get(url, timeout=_DEFAULT_TIMEOUT)
     response.raise_for_status()
     return pd.DataFrame(response.json())
 
@@ -451,7 +456,7 @@ def add_project_labels(
     """
     url = f"{hdr.root}addProjectLabels/{labeltype}/{hdr.key}"
     payload = [label.model_dump(mode="json") for label in labels]
-    response = httpx.post(url, json=payload)
+    response = httpx.post(url, json=payload, timeout=_DEFAULT_TIMEOUT)
     response.raise_for_status()
     return response.json()
 
@@ -498,7 +503,7 @@ def get_iucn_labels(
         "search_term": search_term or "",
     }
     url = f"{hdr.root}getIUCNLabels/{hdr.key}"
-    response = httpx.get(url, params=params)
+    response = httpx.get(url, params=params, timeout=_DEFAULT_TIMEOUT)
     response.raise_for_status()
     return SpeciesTable.model_validate(response.json())
 
@@ -543,7 +548,7 @@ def add_iucn_labels(
     url = f"{hdr.root}addIUCNLabels/{hdr.key}"
     for i, chunk in enumerate(chunks, start=1):
         payload = [label.model_dump(mode="json", by_alias=True) for label in chunk]
-        response = httpx.post(url, json=payload)
+        response = httpx.post(url, json=payload, timeout=_DEFAULT_TIMEOUT)
         response.raise_for_status()
         resp = response.json()
         print(f"submitted {min(i * chunksize, n)} labels of {n}")
@@ -575,7 +580,7 @@ def update_segment_labels(
     """
     url = f"{hdr.root}updateSegmentLabels/{hdr.key}"
     payload = [label.model_dump(mode="json") for label in labels]
-    response = httpx.put(url, json=payload)
+    response = httpx.put(url, json=payload, timeout=_DEFAULT_TIMEOUT)
     response.raise_for_status()
     return response.json()
 
@@ -639,7 +644,7 @@ def update_media_timestamps(
     """
     url = f"{hdr.root}updateTimestamps/{hdr.key}"
     payload = [record.model_dump(mode="json") for record in media_records]
-    response = httpx.put(url, json=payload)
+    response = httpx.put(url, json=payload, timeout=_DEFAULT_TIMEOUT)
     response.raise_for_status()
     result = [TimestampUpdateResponse.model_validate(item) for item in response.json()]
     print(f"Successfully updated {len(result)} media timestamp(s)")
@@ -707,7 +712,7 @@ def set_segment_blank_status(
     """
     status_str = str(blank_status).lower()
     url = f"{hdr.root}segmentLabelsBlankStatus/{hdr.key}/{status_str}"
-    response = httpx.put(url, json=segment_record_ids)
+    response = httpx.put(url, json=segment_record_ids, timeout=_DEFAULT_TIMEOUT)
     response.raise_for_status()
     resp = response.json()
     print(resp.get("message", ""))
@@ -741,7 +746,7 @@ def check_edna_labels(
     """
     url = f"{hdr.root}checkeDNALabels/{hdr.key}"
     payload = [record.model_dump(mode="json", by_alias=True) for record in edna_data]
-    response = httpx.post(url, json=payload)
+    response = httpx.post(url, json=payload, timeout=_DEFAULT_TIMEOUT)
     response.raise_for_status()
     result = [eDNAUploadResponse.model_validate(item) for item in response.json()]
     print(f"Validated {len(result)} eDNA records")
@@ -800,7 +805,7 @@ def check_edna_labels_df(
     ]
 
     url = f"{hdr.root}checkeDNALabels/{hdr.key}"
-    response = httpx.post(url, json=records)
+    response = httpx.post(url, json=records, timeout=_DEFAULT_TIMEOUT)
     response.raise_for_status()
     result = pd.DataFrame(response.json())
     print(f"Validated {len(result)} eDNA records")
@@ -849,7 +854,7 @@ def upload_edna_records(
 
     url = f"{hdr.root}uploadeDNA/{hdr.key}/{project_system_record_id}"
     payload = [record.model_dump(mode="json", by_alias=True) for record in successful]
-    response = httpx.post(url, json=payload)
+    response = httpx.post(url, json=payload, timeout=_DEFAULT_TIMEOUT)
     response.raise_for_status()
     result = [eDNAUploadResponse.model_validate(item) for item in response.json()]
     print(f"Upload complete: {len(result)} records processed")
