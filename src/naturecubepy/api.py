@@ -236,12 +236,16 @@ def plot_stations(geojson_response: gpd.GeoDataFrame) -> Any:
 
     print("Plotting stations")
 
-    # Compute map centre from station geometries
-    centroids = geojson_response.geometry.centroid
+    # Compute centroids in a projected CRS when source data are geographic.
+    if geojson_response.crs is not None and geojson_response.crs.is_geographic:
+        centroids = geojson_response.to_crs(epsg=3857).geometry.centroid.to_crs(geojson_response.crs)
+    else:
+        centroids = geojson_response.geometry.centroid
     centre_lat = centroids.y.mean()
     centre_lon = centroids.x.mean()
 
-    m = folium.Map(location=[centre_lat, centre_lon], zoom_start=10)
+    # Satellite tile layer via xyzservices (handles URL + attribution automatically).
+    m = folium.Map(location=[centre_lat, centre_lon], zoom_start=10, tiles="Esri WorldImagery")
 
     record_counts = geojson_response.get("record_count", pd.Series([1] * len(geojson_response)))
     min_count = record_counts.min() if not record_counts.empty else 1
@@ -252,16 +256,20 @@ def plot_stations(geojson_response: gpd.GeoDataFrame) -> Any:
             return (new_min + new_max) / 2
         return new_min + (value - min_count) / (max_count - min_count) * (new_max - new_min)
 
-    for _, row in geojson_response.iterrows():
-        lat = row.geometry.centroid.y
-        lon = row.geometry.centroid.x
+    for idx, row in geojson_response.iterrows():
+        lat = centroids.loc[idx].y
+        lon = centroids.loc[idx].x
         device_id = row.get("device_id", "")
         start_ts = row.get("project_system_record_start_timestamp", "")
         end_ts = row.get("project_system_record_end_timestamp", "")
         count = row.get("record_count", 1)
+        measurement_type = row.get("measurement_type", "")
+        data_type = row.get("data_type", "")
 
         popup_html = (
-            f"QR code: {device_id}<br>"
+            f"Device ID: {device_id}<br>"
+            f"Measurement type: {measurement_type}<br>"
+            f"Data type: {data_type}<br>"
             f"Start time: {start_ts}<br>"
             f"End time: {end_ts}<br>"
             f"No. media files: {count}<br>"
@@ -591,6 +599,97 @@ def get_camera_trap_data(
     return pd.concat(frames, ignore_index=True, sort=False)
 
 
+def get_audio_observation_data(
+    hdr: AuthHeaders,
+) -> pd.DataFrame:
+    """Retrieve merged bioacoustic (audio) species observation rows.
+
+    Mirrors :func:`get_camera_trap_data` but fetches audio stations and their
+    associated media assets and segments.  The result is a flat DataFrame with
+    one row per labelled audio segment, joined to station location metadata.
+
+    Parameters
+    ----------
+    hdr:
+        Authentication context returned by :func:`auth_headers`.
+
+    Returns
+    -------
+    pandas.DataFrame
+        A DataFrame containing merged audio observation rows with columns
+        including ``project_system_record_id``, ``device_id``, ``data_type``,
+        ``measurement_type``, ``latitude``, ``longitude``, and any additional
+        fields returned by the media asset and segment endpoints.
+
+    Examples
+    --------
+    >>> df = get_audio_observation_data(hdr)  # doctest: +SKIP
+    >>> df.columns.tolist()  # doctest: +SKIP
+    ['project_system_record_id', 'device_id', 'data_type', ...]
+    """
+    stations = get_station_info(hdr, "audio")
+    station_lookup = _build_camera_trap_station_lookup(stations, "audio")  # type: ignore[arg-type]
+    if station_lookup.empty:
+        return pd.DataFrame(
+            columns=[
+                "project_system_record_id",
+                "device_id",
+                "data_type",
+                "measurement_type",
+                "latitude",
+                "longitude",
+            ]
+        )
+
+    psr_ids = station_lookup["project_system_record_id"].tolist()
+    media_df = get_media_assets_df(hdr, "audio", project_system_record_ids=psr_ids)
+    if media_df.empty:
+        return station_lookup.drop(columns=["latitude", "longitude"], errors="ignore")
+
+    if "project_system_record_id" not in media_df.columns and "project_system_record_id_fk" in media_df.columns:
+        media_df["project_system_record_id"] = media_df["project_system_record_id_fk"]
+
+    if "project_system_record_id" not in media_df.columns:
+        raise ValueError(
+            "Media asset data does not contain a project system record identifier. "
+            "Expected 'project_system_record_id' or 'project_system_record_id_fk'."
+        )
+
+    media_df["project_system_record_id"] = pd.to_numeric(
+        media_df["project_system_record_id"],
+        errors="raise",
+    ).astype(int)
+
+    segments_df = get_media_segments(hdr, "audio", project_system_record_ids=psr_ids)
+    merged_df = media_df.copy()
+
+    if not segments_df.empty:
+        segment_merge_columns = [
+            column
+            for column in segments_df.columns
+            if column == "segment_record_id" or column not in merged_df.columns
+        ]
+        merged_df = merged_df.merge(
+            segments_df[segment_merge_columns].drop_duplicates(subset=["segment_record_id"]),
+            on="segment_record_id",
+            how="left",
+        )
+
+    station_merge_columns = ["project_system_record_id"] + [
+        column for column in station_lookup.columns if column not in merged_df.columns
+    ]
+    merged_df = merged_df.merge(
+        station_lookup[station_merge_columns],
+        on="project_system_record_id",
+        how="left",
+    )
+
+    if "data_type" not in merged_df.columns:
+        merged_df["data_type"] = "audio"
+
+    return merged_df.reset_index(drop=True)
+
+
 def get_edna_assets(
     hdr: AuthHeaders,
     project_system_record_id: int,
@@ -621,6 +720,167 @@ def get_edna_assets(
     response = httpx.get(url)
     response.raise_for_status()
     return pd.DataFrame(response.json())
+
+
+def get_edna_observation_data(
+    hdr: AuthHeaders,
+) -> pd.DataFrame:
+    """Retrieve merged eDNA observation rows for all project stations.
+
+    Fetches every eDNA station in the project, pulls assets for each one via
+    :func:`get_edna_assets`, and joins station location metadata (latitude,
+    longitude, device ID, measurement type) onto the result.
+
+    Parameters
+    ----------
+    hdr:
+        Authentication context returned by :func:`auth_headers`.
+
+    Returns
+    -------
+    pandas.DataFrame
+        A flat DataFrame with one row per eDNA asset, merged with station
+        metadata columns ``project_system_record_id``, ``device_id``,
+        ``measurement_type``, ``latitude``, and ``longitude``.
+
+    Examples
+    --------
+    >>> df = get_edna_observation_data(hdr)  # doctest: +SKIP
+    >>> df.head()  # doctest: +SKIP
+    """
+    stations = get_station_info(hdr, "eDNA")
+    station_lookup = _build_camera_trap_station_lookup(stations, "audio")  # type: ignore[arg-type]
+    if station_lookup.empty:
+        return pd.DataFrame(
+            columns=[
+                "project_system_record_id",
+                "device_id",
+                "measurement_type",
+                "latitude",
+                "longitude",
+            ]
+        )
+
+    frames: list[pd.DataFrame] = []
+    for psr_id in station_lookup["project_system_record_id"].tolist():
+        try:
+            assets = get_edna_assets(hdr, project_system_record_id=psr_id)
+        except Exception:
+            continue
+        if not assets.empty:
+            assets["project_system_record_id"] = psr_id
+            frames.append(assets)
+
+    if not frames:
+        return station_lookup.reset_index(drop=True)
+
+    merged_df = pd.concat(frames, ignore_index=True, sort=False)
+
+    station_merge_columns = ["project_system_record_id"] + [
+        col for col in station_lookup.columns if col not in merged_df.columns
+    ]
+    merged_df = merged_df.merge(
+        station_lookup[station_merge_columns],
+        on="project_system_record_id",
+        how="left",
+    )
+
+    if "data_type" not in merged_df.columns:
+        merged_df["data_type"] = "eDNA"
+
+    return merged_df.reset_index(drop=True)
+
+
+# Columns guaranteed to appear in the unified species observation DataFrame.
+_SPECIES_OBS_CORE_COLUMNS: list[str] = [
+    "project_system_record_id",
+    "device_id",
+    "data_type",
+    "measurement_type",
+    "latitude",
+    "longitude",
+    "label",
+    "label_id",
+    "common_name",
+    "species",
+    "genus",
+    "family",
+    "order",
+]
+
+
+def _normalise_species_frame(df: pd.DataFrame, data_type_fallback: str) -> pd.DataFrame:
+    """Ensure core species observation columns are present, filling missing ones with NaN."""
+    if df.empty:
+        return pd.DataFrame(columns=_SPECIES_OBS_CORE_COLUMNS)
+
+    out = df.copy()
+
+    # eDNA records expose 'species' but may not have 'label'; unify them.
+    if "label" not in out.columns:
+        if "species" in out.columns:
+            out["label"] = out["species"]
+        else:
+            out["label"] = pd.NA
+
+    if "data_type" not in out.columns:
+        out["data_type"] = data_type_fallback
+
+    for col in _SPECIES_OBS_CORE_COLUMNS:
+        if col not in out.columns:
+            out[col] = pd.NA
+
+    return out
+
+
+def get_all_species_observations(
+    hdr: AuthHeaders,
+) -> pd.DataFrame:
+    """Retrieve all species identifications across every measurement type.
+
+    Calls :func:`get_camera_trap_data`, :func:`get_audio_observation_data`,
+    and :func:`get_edna_observation_data`, normalises their columns, and
+    concatenates the results into a single flat DataFrame.
+
+    Each row represents one species identification with the station location
+    and measurement context it came from.
+
+    Parameters
+    ----------
+    hdr:
+        Authentication context returned by :func:`auth_headers`.
+
+    Returns
+    -------
+    pandas.DataFrame
+        A DataFrame with at least the columns:
+        ``project_system_record_id``, ``device_id``, ``data_type``,
+        ``measurement_type``, ``latitude``, ``longitude``,
+        ``label``, ``label_id``, ``common_name``,
+        ``species``, ``genus``, ``family``, ``order``.
+        Additional columns from each source are preserved.
+
+    Examples
+    --------
+    >>> obs = get_all_species_observations(hdr)  # doctest: +SKIP
+    >>> obs[["label", "measurement_type", "latitude", "longitude"]].head()  # doctest: +SKIP
+    """
+    frames: list[pd.DataFrame] = []
+
+    camera_df = get_camera_trap_data(hdr)
+    frames.append(_normalise_species_frame(camera_df, "image"))
+
+    audio_df = get_audio_observation_data(hdr)
+    frames.append(_normalise_species_frame(audio_df, "audio"))
+
+    edna_df = get_edna_observation_data(hdr)
+    frames.append(_normalise_species_frame(edna_df, "eDNA"))
+
+    non_empty = [f for f in frames if not f.empty]
+    if not non_empty:
+        return pd.DataFrame(columns=_SPECIES_OBS_CORE_COLUMNS)
+
+    return pd.concat(non_empty, ignore_index=True, sort=False)
 
 
 def get_project_labels(
