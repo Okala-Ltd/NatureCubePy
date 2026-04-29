@@ -22,6 +22,7 @@ from naturecubepy.api import (
     auth_headers_dev,
     check_edna_labels,
     check_edna_labels_df,
+    get_camera_trap_data,
     get_iucn_labels,
     get_key,
     get_media_assets,
@@ -42,6 +43,7 @@ from naturecubepy.api import (
 )
 from naturecubepy.schema import (
     AuthHeaders,
+    CameraTrapDataRecord,
     DataTypes,
     GetProjectGeometryResponse,
     IUCNSpeciesLabelInput,
@@ -77,6 +79,7 @@ __all__ = [
     "plot_stations",
     "get_media_assets",
     "get_media_assets_df",
+    "get_camera_trap_data",
     "get_media_segments",
     "get_project_labels",
     "get_project_labels_df",
@@ -93,6 +96,7 @@ __all__ = [
     "upload_edna_records",
     # schema types
     "AuthHeaders",
+    "CameraTrapDataRecord",
     "DataTypes",
     "GetProjectGeometryResponse",
     "IUCNSpeciesLabelInput",

@@ -16,6 +16,8 @@ from typing import Any
 
 import httpx
 
+from naturecubepy.schema import AuthHeaders
+
 #: Valid item types for phone observations.
 PHONE_TYPES = (
     "phone-photo",
@@ -444,7 +446,7 @@ def validate_observation_payload(
 
 
 def upload_phone_observations(
-    hdr: dict[str, Any],
+    hdr: AuthHeaders,
     project_id: int,
     feature_payload: list[dict[str, Any]],
     device_settings: dict[str, Any],
@@ -510,7 +512,7 @@ def upload_phone_observations(
                 "device_settings": device_settings,
             }
 
-            url = f"{hdr['root']}pushObservation/{hdr['key']}/{project_id}"
+            url = f"{hdr.root}pushObservation/{hdr.key}/{project_id}"
 
             media_files = {}
             if media_dir is not None:
