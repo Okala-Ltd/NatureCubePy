@@ -155,16 +155,16 @@ def get_project(hdr: AuthHeaders, timeout: float = _DEFAULT_TIMEOUT) -> GetProje
 
 def get_station_info(
     hdr: AuthHeaders,
-    datatype: DataTypes,
+    measurement_type: str,
 ) -> gpd.GeoDataFrame:
-    """Retrieve all station metadata for a project.
+    """Retrieve all station metadata for a project, filtered by measurement_type.
 
     Parameters
     ----------
     hdr:
         Authentication context returned by :func:`auth_headers`.
-    datatype:
-        One of ``"video"``, ``"audio"``, ``"image"``, or ``"eDNA"``.
+    measurement_type:
+        Measurement type to filter stations ("camera", "bioacoustic", or "edna").
 
     Returns
     -------
@@ -174,13 +174,24 @@ def get_station_info(
     Examples
     --------
     >>> hdr = auth_headers("mykey")
-    >>> stations = get_station_info(hdr, "video")  # doctest: +SKIP
+    >>> stations = get_station_info(hdr, measurement_type="camera")  # doctest: +SKIP
     """
+    type_map = {
+        "camera": "image",
+        "bioacoustic": "audio",
+        "edna": "eDNA",
+    }
+    mt_lower = measurement_type.lower()
+    if mt_lower not in type_map:
+        raise ValueError(f"Invalid measurement_type: {measurement_type}. Must be one of {list(type_map.keys())}.")
+    datatype = type_map[mt_lower]
     url = f"{hdr.root}getStations/{datatype}/{hdr.key}"
     response = httpx.get(url, timeout=_DEFAULT_TIMEOUT)
     response.raise_for_status()
-    return gpd.read_file(response.text)
-
+    gdf = gpd.read_file(response.text)
+    # Filter by capitalized measurement_type for consistency with API response
+    gdf = gdf[gdf.get("measurement_type", None) == mt_lower.capitalize()]
+    return gdf
 
 def get_stations_typed(
     hdr: AuthHeaders,
@@ -498,20 +509,16 @@ def _build_camera_trap_station_lookup(
 
 def get_camera_trap_data(
     hdr: AuthHeaders,
-    datatype: Literal["image", "video", "both"] = "both",
 ) -> pd.DataFrame:
-    """Retrieve merged camera trap media rows for image and video stations.
+    """Retrieve merged camera trap media rows for all image and video stations.
 
     The returned DataFrame combines station metadata, media assets, and media
-    segments while avoiding duplicate merge columns. By default, both image and
-    video camera trap data are returned together.
+    segments while avoiding duplicate merge columns. Both image and video camera trap data are always returned together.
 
     Parameters
     ----------
     hdr:
         Authentication context returned by :func:`auth_headers`.
-    datatype:
-        ``"image"``, ``"video"``, or ``"both"``. Defaults to ``"both"``.
 
     Returns
     -------
@@ -526,8 +533,8 @@ def get_camera_trap_data(
     """
     frames: list[pd.DataFrame] = []
 
-    for current_datatype in _camera_trap_datatypes(datatype):
-        stations = get_station_info(hdr, current_datatype)
+    for current_datatype in ["image", "video"]:
+        stations = get_station_info(hdr, "camera")
         station_lookup = _build_camera_trap_station_lookup(stations, current_datatype)
         if station_lookup.empty:
             continue
@@ -627,7 +634,7 @@ def get_audio_observation_data(
     >>> df.columns.tolist()  # doctest: +SKIP
     ['project_system_record_id', 'device_id', 'data_type', ...]
     """
-    stations = get_station_info(hdr, "audio")
+    stations = get_station_info(hdr, "bioacoustic")
     station_lookup = _build_camera_trap_station_lookup(stations, "audio")  # type: ignore[arg-type]
     if station_lookup.empty:
         return pd.DataFrame(
