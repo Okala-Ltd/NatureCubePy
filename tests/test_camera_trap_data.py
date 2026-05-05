@@ -55,9 +55,11 @@ def hdr():
 def test_get_camera_trap_data_returns_image_and_video_without_duplicate_columns(hdr):
     image_stations = _station_frame(101, "image", 12.1, -0.1)
     video_stations = _station_frame(202, "video", 12.2, -0.2)
+    all_camera_stations = pd.concat([image_stations, video_stations], ignore_index=True)
 
-    def fake_get_station_info(_hdr, datatype):
-        return image_stations if datatype == "image" else video_stations
+    def fake_get_station_info(_hdr, measurement_type):
+        assert measurement_type == "camera"
+        return all_camera_stations
 
     def fake_get_media_assets_df(_hdr, datatype, project_system_record_ids=None):
         psr_ids = project_system_record_ids or []
@@ -105,4 +107,4 @@ def test_get_camera_trap_data_raises_when_station_ids_missing(hdr):
 
     with patch("naturecubepy.api.get_station_info", return_value=stations):
         with pytest.raises(ValueError, match="project_system_record_id"):
-            get_camera_trap_data(hdr, "image")
+            get_camera_trap_data(hdr)

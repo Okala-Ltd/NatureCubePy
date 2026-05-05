@@ -5,6 +5,8 @@ from __future__ import annotations
 import os
 from unittest.mock import MagicMock, patch
 
+import geopandas as gpd
+import httpx
 import pandas as pd
 import pytest
 
@@ -15,11 +17,16 @@ from naturecubepy.api import (
     auth_headers_dev,
     check_edna_labels,
     check_edna_labels_df,
+    get_audio_observation_data,
+    get_edna_assets,
     get_iucn_labels,
     get_key,
     get_media_assets,
+    get_media_assets_df,
+    get_media_segments,
     get_project,
     get_project_labels,
+    get_species_observations,
     get_station_info,
     push_new_labels,
     push_new_timestamps,
@@ -106,22 +113,116 @@ class TestGetProject:
 
 class TestGetStationInfo:
     def test_returns_geodataframe(self, hdr):
-        geojson_text = """{
+        image_payload = {
             "type": "FeatureCollection",
-            "features": [{
+            "features": [
+                {
+                    "type": "Feature",
+                    "geometry": {"type": "Point", "coordinates": [-1.5, 53.4]},
+                    "properties": {
+                        "device_id": "dev-image",
+                        "record_count": 5,
+                        "measurement_type": "Camera",
+                        "data_type": "image",
+                    },
+                }
+            ],
+        }
+        video_payload = {
+            "type": "FeatureCollection",
+            "features": [
+                {
+                    "type": "Feature",
+                    "geometry": {"type": "Point", "coordinates": [-1.6, 53.5]},
+                    "properties": {
+                        "device_id": "dev-video",
+                        "record_count": 7,
+                        "measurement_type": "Camera",
+                        "data_type": "video",
+                    },
+                }
+            ],
+        }
+
+        image_response = MagicMock()
+        image_response.raise_for_status = MagicMock()
+        image_response.json.return_value = image_payload
+
+        video_response = MagicMock()
+        video_response.raise_for_status = MagicMock()
+        video_response.json.return_value = video_payload
+
+        with patch("naturecubepy.api.httpx.get", side_effect=[image_response, video_response]) as mock_get:
+            result = get_station_info(hdr, "camera")
+
+        import geopandas as gpd
+
+        assert isinstance(result, gpd.GeoDataFrame)
+        assert len(result) == 2
+        assert set(result["data_type"]) == {"image", "video"}
+        assert mock_get.call_count == 2
+
+    def test_paginates_stations_for_single_datatype(self, hdr):
+        def make_feature(idx: int) -> dict:
+            return {
                 "type": "Feature",
                 "geometry": {"type": "Point", "coordinates": [-1.5, 53.4]},
-                "properties": {"device_id": "dev1", "record_count": 5}
-            }]
-        }"""
-        mock_response = MagicMock()
-        mock_response.raise_for_status = MagicMock()
-        mock_response.text = geojson_text
-        with patch("naturecubepy.api.httpx.get", return_value=mock_response):
-            result = get_station_info(hdr, "video")
-        import geopandas as gpd
-        assert isinstance(result, gpd.GeoDataFrame)
-        assert len(result) == 1
+                "properties": {
+                    "project_system_record_id": idx,
+                    "device_id": f"dev-{idx}",
+                    "record_count": 1,
+                    "measurement_type": "Bioacoustic",
+                    "data_type": "audio",
+                },
+            }
+
+        first_page = {
+            "type": "FeatureCollection",
+            "features": [make_feature(i) for i in range(1000)],
+        }
+        second_page = {
+            "type": "FeatureCollection",
+            "features": [make_feature(1001)],
+        }
+
+        first_response = MagicMock()
+        first_response.raise_for_status = MagicMock()
+        first_response.json.return_value = first_page
+
+        second_response = MagicMock()
+        second_response.raise_for_status = MagicMock()
+        second_response.json.return_value = second_page
+
+        with patch("naturecubepy.api.httpx.get", side_effect=[first_response, second_response]) as mock_get:
+            result = get_station_info(hdr, "bioacoustic")
+
+        assert len(result) == 1001
+        assert mock_get.call_count == 2
+
+
+# ---------------------------------------------------------------------------
+# get_species_observations
+# ---------------------------------------------------------------------------
+
+class TestGetSpeciesObservations:
+    def test_combines_requested_domains(self, hdr):
+        camera_df = pd.DataFrame([{"species": "Panthera leo", "data_type": "image", "project_system_record_id": 1}])
+        edna_df = pd.DataFrame([{"species": "Canis lupus", "data_type": "eDNA", "project_system_record_id": 2}])
+
+        with (
+            patch("naturecubepy.api.get_camera_trap_data", return_value=camera_df),
+            patch("naturecubepy.api.get_edna_observation_data", return_value=edna_df),
+        ):
+            result = get_species_observations(hdr, measurement_types=["camera", "edna"])
+
+        assert len(result) == 2
+        assert set(result["data_type"]) == {"image", "eDNA"}
+        assert "latitude" in result.columns
+        assert "longitude" in result.columns
+
+    def test_raises_for_invalid_measurement_type(self, hdr):
+        with pytest.raises(ValueError, match="Invalid measurement_type"):
+            get_species_observations(hdr, measurement_types=["invalid"])
 
 
 # ---------------------------------------------------------------------------
@@ -144,6 +245,289 @@ class TestGetMediaAssets:
             result = get_media_assets(hdr, "video", psr_ids=[123])
         assert isinstance(result, list)
         assert len(result) == 2
+
+
+class TestMediaPagination:
+    def _mock_paginated_endpoint(self):
+        def fake_post(_url, json=None, params=None, timeout=None):
+            response = MagicMock()
+            response.raise_for_status = MagicMock()
+            offset = (params or {}).get("offset", 0)
+            limit = (params or {}).get("limit", 1000)
+
+            if offset == 0:
+                response.json.return_value = [{"id": i} for i in range(limit)]
+            elif offset == limit:
+                response.json.return_value = [{"id": i} for i in range(100)]
+            else:
+                response.json.return_value = []
+            return response
+
+        return fake_post
+
+    def _mock_wrapped_paginated_endpoint(self):
+        def fake_post(_url, json=None, params=None, timeout=None):
+            response = MagicMock()
+            response.raise_for_status = MagicMock()
+            offset = (params or {}).get("offset", 0)
+            limit = (params or {}).get("limit", 1000)
+
+            if offset == 0:
+                rows = [{"id": i} for i in range(limit)]
+            elif offset == limit:
+                rows = [{"id": i} for i in range(100)]
+            else:
+                rows = []
+
+            response.json.return_value = {"rows": rows, "total": 1100}
+            return response
+
+        return fake_post
+
+    def test_get_media_segments_uses_offset_pagination(self, hdr):
+        with patch("naturecubepy.api.httpx.post", side_effect=self._mock_paginated_endpoint()) as mock_post:
+            result = get_media_segments(hdr, "video", project_system_record_ids=[1, 2])
+
+        assert isinstance(result, pd.DataFrame)
+        assert len(result) == 1100
+        assert mock_post.call_count == 2
+
+    def test_get_media_assets_df_uses_offset_pagination(self, hdr):
+        with patch("naturecubepy.api.httpx.post", side_effect=self._mock_paginated_endpoint()) as mock_post:
+            result = get_media_assets_df(hdr, "video", project_system_record_ids=[1, 2])
+
+        assert isinstance(result, pd.DataFrame)
+        assert len(result) == 1100
+        assert mock_post.call_count == 2
+
+    def test_get_media_segments_supports_wrapped_pagination_payload(self, hdr):
+        with patch("naturecubepy.api.httpx.post", side_effect=self._mock_wrapped_paginated_endpoint()) as mock_post:
+            result = get_media_segments(hdr, "video", project_system_record_ids=[1, 2])
+
+        assert isinstance(result, pd.DataFrame)
+        assert len(result) == 1100
+        assert mock_post.call_count == 2
+
+    def test_get_media_assets_df_supports_wrapped_pagination_payload(self, hdr):
+        with patch("naturecubepy.api.httpx.post", side_effect=self._mock_wrapped_paginated_endpoint()) as mock_post:
+            result = get_media_assets_df(hdr, "video", project_system_record_ids=[1, 2])
+
+        assert isinstance(result, pd.DataFrame)
+        assert len(result) == 1100
+        assert mock_post.call_count == 2
+
+
+def test_get_audio_observation_data_prefers_segment_taxonomy_values(hdr):
+    stations = gpd.GeoDataFrame(
+        {
+            "project_system_record_id": [101],
+            "device_id": ["device-audio"],
+            "measurement_type": ["Bioacoustic"],
+            "data_type": ["audio"],
+        },
+        geometry=gpd.points_from_xy([12.1], [-0.1]),
+        crs="EPSG:4326",
+    )
+
+    media_assets = pd.DataFrame(
+        [
+            {
+                "segment_record_id": 11,
+                "project_system_record_id_fk": 101,
+                "label": "Mammalia",
+                "species": "Panthera leo",
+                "common_name": "lion",
+            }
+        ]
+    )
+
+    media_segments = pd.DataFrame(
+        [
+            {
+                "segment_record_id": 11,
+                "label": "Aves",
+                "species": "Corvus corax",
+                "common_name": "raven",
+            }
+        ]
+    )
+
+    with (
+        patch("naturecubepy.api._fetch_stations_for_datatype", return_value=stations),
+        patch("naturecubepy.api.get_media_assets_df", return_value=media_assets),
+        patch("naturecubepy.api.get_media_segments", return_value=media_segments),
+    ):
+        result = get_audio_observation_data(hdr, include_iucn_status=False)
+
+    assert result.loc[0, "label"] == "Aves"
+    assert result.loc[0, "species"] == "Corvus corax"
+    assert result.loc[0, "common_name"] == "raven"
+
+
+def test_get_audio_observation_data_handles_station_measurement_type_mismatch(hdr):
+    stations = gpd.GeoDataFrame(
+        {
+            "project_system_record_id": [101],
+            "device_id": ["device-audio"],
+            "measurement_type": ["audio"],
+            "data_type": ["audio"],
+        },
+        geometry=gpd.points_from_xy([12.1], [-0.1]),
+        crs="EPSG:4326",
+    )
+
+    media_assets = pd.DataFrame(
+        [
+            {
+                "segment_record_id": 11,
+                "project_system_record_id_fk": 101,
+                "label": "Aves",
+                "label_id": 500,
+                "species": "Corvus corax",
+            }
+        ]
+    )
+
+    with (
+        patch("naturecubepy.api._fetch_stations_for_datatype", return_value=stations),
+        patch("naturecubepy.api.get_media_assets_df", return_value=media_assets),
+        patch("naturecubepy.api.get_media_segments", return_value=pd.DataFrame()),
+    ):
+        result = get_audio_observation_data(hdr, include_iucn_status=False)
+
+    assert not result.empty
+    assert result.loc[0, "label"] == "Aves"
+    assert result.loc[0, "species"] == "Corvus corax"
+
+
+# ---------------------------------------------------------------------------
+# get_edna_assets
+# ---------------------------------------------------------------------------
+
+class TestGetEdnaAssets:
+    def test_supports_flat_list_payload(self, hdr):
+        mock_response = MagicMock()
+        mock_response.raise_for_status = MagicMock()
+        mock_response.json.return_value = [
+            {"label": "Panthera leo", "species": "Panthera leo", "label_id": 1},
+        ]
+
+        with patch("naturecubepy.api.httpx.get", return_value=mock_response):
+            result = get_edna_assets(hdr, project_system_record_id=123)
+
+        assert isinstance(result, pd.DataFrame)
+        assert not result.empty
+        assert result.iloc[0]["label"] == "Panthera leo"
+
+    def test_supports_wrapped_table_payload(self, hdr):
+        mock_response = MagicMock()
+        mock_response.raise_for_status = MagicMock()
+        mock_response.json.return_value = {
+            "table": [
+                {"label": "Canis lupus", "species": "Canis lupus", "label_id": 2},
+            ],
+            "sankey": [],
+        }
+
+        with patch("naturecubepy.api.httpx.get", return_value=mock_response):
+            result = get_edna_assets(hdr, project_system_record_id=456)
+
+        assert isinstance(result, pd.DataFrame)
+        assert not result.empty
+        assert result.iloc[0]["label"] == "Canis lupus"
+
+    def test_retries_on_429_then_succeeds(self, hdr):
+        rate_limited = MagicMock()
+        rate_limited.raise_for_status.side_effect = httpx.HTTPStatusError(
+            "Too Many Requests",
+            request=httpx.Request("GET", "https://example.invalid"),
+            response=httpx.Response(429, headers={"Retry-After": "0"}),
+        )
+
+        ok = MagicMock()
+        ok.raise_for_status = MagicMock()
+        ok.json.return_value = [{"label": "Panthera leo", "species": "Panthera leo", "label_id": 1}]
+
+        with (
+            patch("naturecubepy.api.httpx.get", side_effect=[rate_limited, ok]) as mock_get,
+            patch("naturecubepy.api.time.sleep") as mock_sleep,
+        ):
+            result = get_edna_assets(hdr, project_system_record_id=123)
+
+        assert mock_get.call_count == 2
+        assert mock_sleep.call_count == 1
+        assert not result.empty
+
+    def test_raises_after_retries_exhausted(self, hdr):
+        rate_limited = MagicMock()
+        rate_limited.raise_for_status.side_effect = httpx.HTTPStatusError(
+            "Too Many Requests",
+            request=httpx.Request("GET", "https://example.invalid"),
+            response=httpx.Response(429, headers={"Retry-After": "0"}),
+        )
+
+        with (
+            patch("naturecubepy.api.httpx.get", return_value=rate_limited),
+            patch("naturecubepy.api.time.sleep"),
+            pytest.raises(httpx.HTTPStatusError),
+        ):
+            get_edna_assets(hdr, project_system_record_id=123)
+
+
+class TestGetEdnaObservationData:
+    def _edna_station_frame(self, psr_ids, record_counts):
+        return gpd.GeoDataFrame(
+            {
+                "project_system_record_id": psr_ids,
+                "device_id": [f"dev-{i}" for i in psr_ids],
+                "measurement_type": ["eDNA"] * len(psr_ids),
+                "data_type": ["eDNA"] * len(psr_ids),
+                "record_count": record_counts,
+            },
+            geometry=gpd.points_from_xy([150.0 + i for i in range(len(psr_ids))], [-33.0] * len(psr_ids)),
+            crs="EPSG:4326",
+        )
+
+    def test_skips_zero_record_stations(self, hdr):
+        stations = self._edna_station_frame([1001, 1002], [2, 0])
+
+        def fake_get_edna_assets(_hdr, project_system_record_id):
+            assert project_system_record_id == 1001
+            return pd.DataFrame([
+                {"label": "Panthera leo", "species": "Panthera leo", "label_id": 1}
+            ])
+
+        with (
+            patch("naturecubepy.api.get_station_info", return_value=stations),
+            patch("naturecubepy.api.get_edna_assets", side_effect=fake_get_edna_assets),
+        ):
+            from naturecubepy.api import get_edna_observation_data
+
+            result = get_edna_observation_data(hdr)
+
+        assert not result.empty
+        assert set(result["project_system_record_id"]) == {1001}
+
+    def test_http_500_is_treated_as_no_data(self, hdr, capsys):
+        stations = self._edna_station_frame([6731], [1])
+
+        def raise_500(_hdr, project_system_record_id):
+            request = httpx.Request("GET", f"https://example.invalid/{project_system_record_id}")
+            response = httpx.Response(500, request=request)
+            raise httpx.HTTPStatusError("Server error", request=request, response=response)
+
+        with (
+            patch("naturecubepy.api.get_station_info", return_value=stations),
+            patch("naturecubepy.api.get_edna_assets", side_effect=raise_500),
+        ):
+            from naturecubepy.api import get_edna_observation_data
+
+            result = get_edna_observation_data(hdr)
+
+        captured = capsys.readouterr()
+        assert "Warning: could not retrieve eDNA species labels" not in captured.out
+        assert "project_system_record_id" in result.columns
+        assert not result.empty
 
 
 # ---------------------------------------------------------------------------

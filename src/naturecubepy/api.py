@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import math
 import os
+import time
 from typing import Any, Literal
 
 import geopandas as gpd
@@ -37,12 +38,16 @@ from naturecubepy.schema import (
 
 _PROD_URL = "https://naturecube.io/api/"
 _DEV_URL = "http://127.0.0.1:8000/api/"
-_DEFAULT_TIMEOUT = 60.0
+_DEFAULT_TIMEOUT = 180.0
+_STATIONS_PAGE_SIZE = 1000
+_MEDIA_FETCH_CHUNK_SIZE = 100
+_RATE_LIMIT_MAX_RETRIES = 4
+_RATE_LIMIT_BACKOFF_SECONDS = 0.5
 
-_MEASUREMENT_TYPE_TO_DATATYPE = {
-    "camera": "image",
-    "bioacoustic": "audio",
-    "edna": "eDNA",
+_MEASUREMENT_TYPE_TO_DATATYPES = {
+    "camera": ["image", "video"],
+    "bioacoustic": ["audio"],
+    "edna": ["eDNA"],
 }
 
 # Columns guaranteed to appear in the unified species observation DataFrame.
@@ -72,6 +77,46 @@ _STATION_LOOKUP_COLUMNS: list[str] = [
 ]
 
 _EMPTY_OBSERVATION_FRAME = pd.DataFrame(columns=_SPECIES_OBS_CORE_COLUMNS)
+
+
+def _extract_rows_from_payload(payload: Any) -> list[dict[str, Any]]:
+    """Normalise list/dict API payloads to a list of row dictionaries."""
+    if isinstance(payload, list):
+        return [row for row in payload if isinstance(row, dict)]
+
+    if isinstance(payload, dict):
+        for key in ("table", "rows", "data", "items", "results"):
+            rows = payload.get(key)
+            if isinstance(rows, list):
+                return [row for row in rows if isinstance(row, dict)]
+        return [payload]
+
+    return []
+
+
+def _extract_total_count(payload: Any) -> int | None:
+    """Extract total row count from paginated payloads when available."""
+    if not isinstance(payload, dict):
+        return None
+
+    for key in ("total", "total_count", "totalCount", "count", "recordsTotal"):
+        if key not in payload:
+            continue
+        try:
+            total = int(payload[key])
+        except (TypeError, ValueError):
+            continue
+        if total >= 0:
+            return total
+    return None
+
+
+def _should_fetch_next_page(payload: Any, fetched_count: int, offset: int, limit: int) -> bool:
+    """Determine whether another paginated request is needed."""
+    total = _extract_total_count(payload)
+    if total is not None:
+        return (offset + fetched_count) < total
+    return fetched_count >= limit
 
 
 # ---------------------------------------------------------------------------
@@ -190,7 +235,78 @@ def get_project(hdr: AuthHeaders, timeout: float = _DEFAULT_TIMEOUT) -> GetProje
     return GetProjectGeometryResponse.model_validate(data)
 
 
-def get_station_info(hdr: AuthHeaders, measurement_type: str) -> gpd.GeoDataFrame:
+def _normalise_measurement_type(measurement_type: str | None) -> str | None:
+    """Normalise measurement type input to internal lowercase keys."""
+    if measurement_type is None:
+        return None
+    mt = str(measurement_type).strip().lower()
+    if mt == "all":
+        return None
+    if mt == "edna":
+        return "edna"
+    return mt
+
+
+def _get_station_features_raw(hdr: AuthHeaders, datatype: str) -> list[dict[str, Any]]:
+    """Fetch all raw GeoJSON features for a datatype endpoint, handling pagination."""
+    url = f"{hdr.root}getStations/{datatype}/{hdr.key}"
+    offset = 0
+    all_features: list[dict[str, Any]] = []
+
+    while True:
+        params = {"offset": offset, "limit": _STATIONS_PAGE_SIZE}
+        response = httpx.get(url, params=params, timeout=_DEFAULT_TIMEOUT)
+        response.raise_for_status()
+        payload = response.json()
+        features = payload.get("features", []) if isinstance(payload, dict) else []
+        if not features:
+            break
+        all_features.extend(features)
+        if len(features) < _STATIONS_PAGE_SIZE:
+            break
+        offset += _STATIONS_PAGE_SIZE
+
+    return all_features
+
+
+def _fetch_stations_for_datatype(hdr: AuthHeaders, datatype: str) -> gpd.GeoDataFrame:
+    """Fetch all station rows for a datatype as a GeoDataFrame (paginated)."""
+    features = _get_station_features_raw(hdr, datatype)
+    if not features:
+        return gpd.GeoDataFrame()
+    return gpd.GeoDataFrame.from_features(features)
+
+
+def _filter_stations_by_measurement_type(gdf: gpd.GeoDataFrame, measurement_type: str) -> gpd.GeoDataFrame:
+    """Filter station rows by measurement type when the column exists."""
+    if "measurement_type" not in gdf.columns:
+        return gdf
+    measurement_series = gdf["measurement_type"].astype(str).str.strip().str.lower()
+    return gdf[measurement_series == measurement_type]
+
+
+def _filter_stations_by_datatype(stations: gpd.GeoDataFrame, datatype: str) -> gpd.GeoDataFrame:
+    """Filter station rows by datatype when available.
+
+    Some API responses include mixed datatypes in a single payload, so this
+    guard ensures each downstream fetch only uses station IDs for the target
+    datatype.
+    """
+    if "data_type" not in stations.columns:
+        return stations
+    dtype_series = stations["data_type"].astype(str).str.strip().str.lower()
+    return stations[dtype_series == datatype.lower()]
+
+
+def _filter_stations_with_records(stations: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
+    """Filter stations to rows that report at least one record when available."""
+    if "record_count" not in stations.columns:
+        return stations
+    counts = pd.to_numeric(stations["record_count"], errors="coerce").fillna(0)
+    return stations[counts > 0]
+
+
+def get_station_info(hdr: AuthHeaders, measurement_type: str | None) -> gpd.GeoDataFrame:
     """Retrieve all station metadata for a project, optionally filtered by measurement type.
 
     Parameters
@@ -199,6 +315,7 @@ def get_station_info(hdr: AuthHeaders, measurement_type: str) -> gpd.GeoDataFram
         Authentication context returned by :func:`auth_headers`.
     measurement_type:
         One of ``"camera"``, ``"bioacoustic"``, ``"edna"``, or None/"all" for all stations.
+        ``"camera"`` fetches and combines both ``"image"`` and ``"video"`` stations.
 
     Returns
     -------
@@ -215,34 +332,31 @@ def get_station_info(hdr: AuthHeaders, measurement_type: str) -> gpd.GeoDataFram
     >>> stations = get_station_info(hdr, measurement_type="camera")  # doctest: +SKIP
     >>> all_stations = get_station_info(hdr, measurement_type=None)  # doctest: +SKIP
     """
-    if measurement_type is None or str(measurement_type).lower() == "all":
-        # Fetch all types and concatenate
+    normalised_mt = _normalise_measurement_type(measurement_type)
+    if normalised_mt is None:
+        # Fetch all supported endpoint datatypes and concatenate.
         dfs = []
-        for mt, datatype in _MEASUREMENT_TYPE_TO_DATATYPE.items():
-            url = f"{hdr.root}getStations/{datatype}/{hdr.key}"
-            response = httpx.get(url, timeout=_DEFAULT_TIMEOUT)
-            response.raise_for_status()
-            gdf = gpd.read_file(response.text)
-            # Only keep stations matching the measurement_type (in case API returns more)
-            gdf = gdf[gdf.get("measurement_type", None) == mt.capitalize()]
-            dfs.append(gdf)
+        for mt, datatypes in _MEASUREMENT_TYPE_TO_DATATYPES.items():
+            for datatype in datatypes:
+                gdf = _fetch_stations_for_datatype(hdr, datatype)
+                dfs.append(_filter_stations_by_measurement_type(gdf, mt))
         if dfs:
             return gpd.GeoDataFrame(pd.concat(dfs, ignore_index=True))
-        else:
-            return gpd.GeoDataFrame()
-    else:
-        mt_lower = str(measurement_type).lower()
-        if mt_lower not in _MEASUREMENT_TYPE_TO_DATATYPE:
-            raise ValueError(
-                f"Invalid measurement_type: {measurement_type!r}. "
-                f"Must be one of {list(_MEASUREMENT_TYPE_TO_DATATYPE)} or None/'all'."
-            )
-        datatype = _MEASUREMENT_TYPE_TO_DATATYPE[mt_lower]
-        url = f"{hdr.root}getStations/{datatype}/{hdr.key}"
-        response = httpx.get(url, timeout=_DEFAULT_TIMEOUT)
-        response.raise_for_status()
-        gdf = gpd.read_file(response.text)
-        return gdf[gdf.get("measurement_type", None) == mt_lower.capitalize()]
+        return gpd.GeoDataFrame()
+
+    if normalised_mt not in _MEASUREMENT_TYPE_TO_DATATYPES:
+        raise ValueError(
+            f"Invalid measurement_type: {measurement_type!r}. "
+            f"Must be one of {list(_MEASUREMENT_TYPE_TO_DATATYPES)} or None/'all'."
+        )
+
+    dfs = []
+    for datatype in _MEASUREMENT_TYPE_TO_DATATYPES[normalised_mt]:
+        gdf = _fetch_stations_for_datatype(hdr, datatype)
+        dfs.append(_filter_stations_by_measurement_type(gdf, normalised_mt))
+    if dfs:
+        return gpd.GeoDataFrame(pd.concat(dfs, ignore_index=True))
+    return gpd.GeoDataFrame()
 
 
 def get_stations_typed(hdr: AuthHeaders, datatype: DataTypes) -> StationResponseAPI:
@@ -264,10 +378,8 @@ def get_stations_typed(hdr: AuthHeaders, datatype: DataTypes) -> StationResponse
     --------
     >>> stations = get_stations_typed(hdr, "video")  # doctest: +SKIP
     """
-    url = f"{hdr.root}getStations/{datatype}/{hdr.key}"
-    response = httpx.get(url, timeout=_DEFAULT_TIMEOUT)
-    response.raise_for_status()
-    return StationResponseAPI.model_validate(response.json())
+    features = _get_station_features_raw(hdr, datatype)
+    return StationResponseAPI.model_validate({"type": "FeatureCollection", "features": features})
 
 
 def plot_stations(geojson_response: gpd.GeoDataFrame) -> Any:
@@ -382,13 +494,58 @@ def get_media_assets(
         params = {"offset": current_offset, "limit": limit}
         response = httpx.post(url, json=psr_ids, params=params, timeout=_DEFAULT_TIMEOUT)
         response.raise_for_status()
-        items = response.json()
+        payload = response.json()
+        items = _extract_rows_from_payload(payload)
         if not items:
             break
         all_results.extend([MediaRecordAPIFlat.model_validate(item) for item in items])
-        if len(items) < limit:
+        if not _should_fetch_next_page(payload, fetched_count=len(items), offset=current_offset, limit=limit):
             break
-        current_offset += limit
+        current_offset += len(items)
+    return all_results
+
+
+def _fetch_paginated_rows_for_psr_ids(
+    url: str,
+    project_system_record_ids: int | list[int],
+    *,
+    error_label: str | None = None,
+) -> list[dict[str, Any]]:
+    """Fetch paginated rows for PSR IDs using consistent chunked requests."""
+    psr_ids = _normalise_psr_ids(project_system_record_ids)
+    chunk_size = _MEDIA_FETCH_CHUNK_SIZE
+    limit = 1000
+    all_results: list[dict[str, Any]] = []
+
+    for i in range(0, len(psr_ids), chunk_size):
+        chunk = psr_ids[i:i + chunk_size]
+        offset = 0
+
+        while True:
+            params = {"offset": offset, "limit": limit}
+            response: httpx.Response | None = None
+            try:
+                response = httpx.post(url, json=chunk, params=params, timeout=_DEFAULT_TIMEOUT)
+                response.raise_for_status()
+            except Exception as exc:
+                if error_label is not None:
+                    print(
+                        f"Error fetching {error_label}: {exc}\n"
+                        f"Payload: {chunk}\n"
+                        f"Response: {getattr(response, 'text', '')}"
+                    )
+                raise
+
+            payload = response.json()
+            items = _extract_rows_from_payload(payload)
+            if not items:
+                break
+
+            all_results.extend(items)
+            if not _should_fetch_next_page(payload, fetched_count=len(items), offset=offset, limit=limit):
+                break
+            offset += len(items)
+
     return all_results
 
 
@@ -418,29 +575,12 @@ def get_media_assets_df(
     >>> assets = get_media_assets_df(hdr, "video", project_system_record_ids=[123, 456])  # doctest: +SKIP
     """
     url = f"{hdr.root}getMediaAssets/{datatype}/{hdr.key}"
-    all_results = []
-    psr_ids = _normalise_psr_ids(project_system_record_ids)
-    chunk_size = 25  # Tune for backend performance
-    for i in range(0, len(psr_ids), chunk_size):
-        chunk = psr_ids[i:i+chunk_size]
-        offset = 0
-        limit = 1000
-        while True:
-            params = {"offset": offset, "limit": limit}
-            try:
-                response = httpx.post(url, json=chunk, params=params, timeout=_DEFAULT_TIMEOUT)
-                response.raise_for_status()
-            except Exception as exc:
-                print(f"Error fetching media assets: {exc}\nPayload: {chunk}\nResponse: {getattr(response, 'text', '')}")
-                raise
-            items = response.json()
-            if not items:
-                break
-            all_results.extend(items)
-            if len(items) < limit:
-                break
-            offset += limit
-    return pd.DataFrame(all_results)
+    rows = _fetch_paginated_rows_for_psr_ids(
+        url,
+        project_system_record_ids,
+        error_label="media assets",
+    )
+    return pd.DataFrame(rows)
 
 
 def get_media_segments(
@@ -469,25 +609,8 @@ def get_media_segments(
     >>> segments = get_media_segments(hdr, "audio", project_system_record_ids=[123, 456])  # doctest: +SKIP
     """
     url = f"{hdr.root}getMediaSegments/{datatype}/{hdr.key}"
-    all_results = []
-    psr_ids = _normalise_psr_ids(project_system_record_ids)
-    chunk_size = 25  # Tune for backend performance
-    for i in range(0, len(psr_ids), chunk_size):
-        chunk = psr_ids[i:i+chunk_size]
-        offset = 0
-        limit = 1000
-        while True:
-            params = {"offset": offset, "limit": limit}
-            response = httpx.post(url, json=chunk, params=params, timeout=_DEFAULT_TIMEOUT)
-            response.raise_for_status()
-            items = response.json()
-            if not items:
-                break
-            all_results.extend(items)
-            if len(items) < limit:
-                break
-            offset += limit
-    return pd.DataFrame(all_results)
+    rows = _fetch_paginated_rows_for_psr_ids(url, project_system_record_ids)
+    return pd.DataFrame(rows)
 
 
 # ---------------------------------------------------------------------------
@@ -547,15 +670,39 @@ def _resolve_psr_id_column(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _merge_segments(media_df: pd.DataFrame, segments_df: pd.DataFrame) -> pd.DataFrame:
-    """Left-join segment columns onto a media DataFrame, avoiding duplicate columns."""
+    """Left-join segment columns onto media rows, preferring segment values.
+
+    Some backends return overlapping fields (for example ``label`` and
+    ``species``) in both media-assets and segment payloads. Segment rows can
+    contain newer/verified values, so segment values should override media
+    values when present.
+    """
     if segments_df.empty:
         return media_df
-    segment_cols = [c for c in segments_df.columns if c == "segment_record_id" or c not in media_df.columns]
-    return media_df.merge(
-        segments_df[segment_cols].drop_duplicates(subset=["segment_record_id"]),
+
+    segment_unique = segments_df.drop_duplicates(subset=["segment_record_id"])
+    merged = media_df.merge(
+        segment_unique,
         on="segment_record_id",
         how="left",
+        suffixes=("", "__segment"),
     )
+
+    for col in segment_unique.columns:
+        if col == "segment_record_id":
+            continue
+
+        segment_col = f"{col}__segment"
+        if segment_col not in merged.columns:
+            continue
+
+        if col in merged.columns:
+            merged[col] = merged[segment_col].combine_first(merged[col])
+        else:
+            merged[col] = merged[segment_col]
+        merged = merged.drop(columns=[segment_col])
+
+    return merged
 
 
 def _merge_station_lookup(media_df: pd.DataFrame, station_lookup: pd.DataFrame) -> pd.DataFrame:
@@ -572,34 +719,86 @@ def _fetch_and_merge_media(
     station_lookup: pd.DataFrame,
     data_type_fallback: str,
 ) -> pd.DataFrame:
-    """Fetch media assets and segments, merge with station lookup, and return a flat DataFrame."""
-    psr_ids = station_lookup["project_system_record_id"].tolist()
-    chunk_size = 100  
-    media_frames = []
-    segment_frames = []
-    for i in range(0, len(psr_ids), chunk_size):
-        chunk = psr_ids[i:i+chunk_size]
-        media_df = get_media_assets_df(hdr, datatype, project_system_record_ids=chunk)
-        if not media_df.empty:
-            media_frames.append(media_df)
-        segments_df = get_media_segments(hdr, datatype, project_system_record_ids=chunk)
-        if not segments_df.empty:
-            segment_frames.append(segments_df)
+    """Fetch media assets, merge with station lookup, and return a flat DataFrame.
 
-    if not media_frames:
+    Media rows are fetched in one batched path, then optional segment fields
+    are joined in one batched pass.
+    """
+    psr_ids = station_lookup["project_system_record_id"].tolist()
+    media_df = get_media_assets_df(hdr, datatype, project_system_record_ids=psr_ids)
+    if media_df.empty:
         return pd.DataFrame()
 
-    media_df = pd.concat(media_frames, ignore_index=True)
     media_df = _resolve_psr_id_column(media_df)
-    segments_df = pd.concat(segment_frames, ignore_index=True) if segment_frames else pd.DataFrame()
-
-    merged = _merge_segments(media_df, segments_df)
-    merged = _merge_station_lookup(merged, station_lookup)
+    segments_df = get_media_segments(hdr, datatype, project_system_record_ids=psr_ids)
+    media_df = _merge_segments(media_df, segments_df)
+    merged = _merge_station_lookup(media_df, station_lookup)
 
     if "data_type" not in merged.columns:
         merged["data_type"] = data_type_fallback
 
     return merged
+
+
+def _fetch_and_merge_edna_assets(hdr: AuthHeaders, station_lookup: pd.DataFrame) -> pd.DataFrame:
+    """Fetch eDNA assets for a station lookup and merge location metadata."""
+    frames: list[pd.DataFrame] = []
+    errors: list[str] = []
+    for psr_id in station_lookup["project_system_record_id"].tolist():
+        try:
+            assets = get_edna_assets(hdr, project_system_record_id=psr_id)
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code in {404, 500}:
+                # The backend may return 500 for stations without eDNA rows.
+                # Treat these as no-data stations and continue.
+                continue
+            msg = (
+                f"eDNA assets API returned HTTP {exc.response.status_code} for PSR {psr_id}. "
+                "Species labels will be unavailable for this station."
+            )
+            errors.append(msg)
+            continue
+        except Exception as exc:
+            errors.append(f"Failed to fetch eDNA assets for PSR {psr_id}: {exc}")
+            continue
+        if not assets.empty:
+            assets = assets.copy()
+            assets["project_system_record_id"] = psr_id
+            frames.append(assets)
+
+    if not frames:
+        if errors:
+            print(
+                f"Warning: could not retrieve eDNA species labels ({len(errors)} station(s) failed). "
+                f"First error: {errors[0]}"
+            )
+        return pd.DataFrame()
+
+    merged = pd.concat(frames, ignore_index=True, sort=False)
+    merged = _merge_station_lookup(merged, station_lookup)
+    if "data_type" not in merged.columns:
+        merged["data_type"] = "eDNA"
+    return merged
+
+
+def _fetch_observations_for_datatype(
+    hdr: AuthHeaders,
+    datatype: str,
+    stations: gpd.GeoDataFrame,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Fetch observation rows for a single datatype and attach station metadata."""
+    scoped_stations = _filter_stations_by_datatype(stations, datatype)
+    if str(datatype).lower() == "edna":
+        scoped_stations = _filter_stations_with_records(scoped_stations)
+    station_lookup = _build_station_lookup(scoped_stations, datatype)
+    if station_lookup.empty:
+        return pd.DataFrame(), station_lookup
+
+    if str(datatype).lower() == "edna":
+        merged = _fetch_and_merge_edna_assets(hdr, station_lookup)
+    else:
+        merged = _fetch_and_merge_media(hdr, datatype, station_lookup, str(datatype))
+    return merged, station_lookup
 
 
 # ---------------------------------------------------------------------------
@@ -638,12 +837,8 @@ def get_camera_trap_data(
     stations = get_station_info(hdr, "camera")
     frames: list[pd.DataFrame] = []
 
-    for datatype in ("image", "video"):
-        station_lookup = _build_station_lookup(stations, datatype)
-        if station_lookup.empty:
-            continue
-
-        merged = _fetch_and_merge_media(hdr, datatype, station_lookup, datatype)  # type: ignore[arg-type]
+    for datatype in _MEASUREMENT_TYPE_TO_DATATYPES["camera"]:
+        merged, _ = _fetch_observations_for_datatype(hdr, datatype, stations)
         if merged.empty:
             continue
 
@@ -687,17 +882,31 @@ def get_audio_observation_data(
     >>> df = get_audio_observation_data(hdr)  # doctest: +SKIP
     >>> df = get_audio_observation_data(hdr, include_iucn_status=True)  # doctest: +SKIP
     """
-    stations = get_station_info(hdr, "bioacoustic")
-    station_lookup = _build_station_lookup(stations, "audio")
+    # Pull directly from the audio datatype endpoint to avoid depending on
+    # backend measurement_type naming consistency (e.g. "audio" vs "bioacoustic").
+    stations = _fetch_stations_for_datatype(hdr, "audio")
+    merged, station_lookup = _fetch_observations_for_datatype(hdr, "audio", stations)
     if station_lookup.empty:
         return pd.DataFrame(columns=_STATION_LOOKUP_COLUMNS)
-
-    merged = _fetch_and_merge_media(hdr, "audio", station_lookup, "audio")  # type: ignore[arg-type]
     if merged.empty:
         return station_lookup.drop(columns=["latitude", "longitude"], errors="ignore")
     if include_iucn_status:
         merged = _enrich_with_iucn_status(merged, _build_iucn_map(hdr))
     return merged.reset_index(drop=True)
+
+
+def get_audio_data(
+    hdr: AuthHeaders,
+    include_iucn_status: bool = False,
+) -> pd.DataFrame:
+    """Retrieve merged bioacoustic (audio) rows.
+
+    This is a convenience alias for get_audio_observation_data.
+    """
+    return get_audio_observation_data(
+        hdr=hdr,
+        include_iucn_status=include_iucn_status,
+    )
 
 
 def get_edna_assets(hdr: AuthHeaders, project_system_record_id: int) -> pd.DataFrame:
@@ -728,52 +937,85 @@ def get_edna_assets(hdr: AuthHeaders, project_system_record_id: int) -> pd.DataF
     if psr_id <= 0:
         raise ValueError("project_system_record_id must be a positive integer.")
     url = f"{hdr.root}geteDNAAssets/{psr_id}/{hdr.key}"
-    response = httpx.get(url, timeout=_DEFAULT_TIMEOUT)
-    response.raise_for_status()
-    return pd.DataFrame(response.json())
+    response: httpx.Response | None = None
+    for attempt in range(_RATE_LIMIT_MAX_RETRIES + 1):
+        response = httpx.get(url, timeout=_DEFAULT_TIMEOUT)
+        try:
+            response.raise_for_status()
+            break
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code != 429 or attempt >= _RATE_LIMIT_MAX_RETRIES:
+                raise
+            retry_after = exc.response.headers.get("Retry-After")
+            try:
+                delay = float(retry_after) if retry_after is not None else 0.0
+            except (TypeError, ValueError):
+                delay = 0.0
+            if delay <= 0:
+                delay = _RATE_LIMIT_BACKOFF_SECONDS * (2**attempt)
+            time.sleep(delay)
+    if response is None:
+        return pd.DataFrame()
+    payload = response.json()
+
+    # Backends may return either a flat list of rows or a wrapped payload
+    # containing the table in a top-level key.
+    if isinstance(payload, list):
+        rows = payload
+    elif isinstance(payload, dict):
+        if isinstance(payload.get("table"), list):
+            rows = payload["table"]
+        elif isinstance(payload.get("rows"), list):
+            rows = payload["rows"]
+        elif isinstance(payload.get("data"), list):
+            rows = payload["data"]
+        else:
+            rows = [payload]
+    else:
+        rows = []
+
+    return pd.DataFrame(rows)
 
 
-def get_edna_observation_data(hdr: AuthHeaders) -> pd.DataFrame:
+def get_edna_observation_data(
+    hdr: AuthHeaders,
+    include_iucn_status: bool = False,
+) -> pd.DataFrame:
     """Retrieve merged eDNA observation rows for all project stations.
 
     Parameters
     ----------
     hdr:
         Authentication context returned by :func:`auth_headers`.
+    include_iucn_status:
+        If ``True``, add an ``iucn_redlist_status`` column joined
+        from the project labels.  The eDNA backend already includes IUCN status
+        in its response; this flag adds a second enrichment pass from the
+        project labels endpoint for any rows where the status is absent.
 
     Returns
     -------
     pandas.DataFrame
-        A flat DataFrame with one row per eDNA asset, merged with station
-        metadata columns.
+        A flat DataFrame with one row per eDNA observation, merged with station
+        location columns (``latitude``, ``longitude``, ``device_id``) and
+        species identification fields (``label``, ``species``, ``genus``,
+        ``family``, ``order``, ``common_name``, ``iucn_redlist_status``).
 
     Examples
     --------
     >>> df = get_edna_observation_data(hdr)  # doctest: +SKIP
     """
-    stations = get_station_info(hdr, "eDNA")
-    station_lookup = _build_station_lookup(stations, "eDNA")
+    stations = get_station_info(hdr, "edna")
+    merged, station_lookup = _fetch_observations_for_datatype(hdr, "eDNA", stations)
     if station_lookup.empty:
         return pd.DataFrame(columns=["project_system_record_id", "device_id", "measurement_type", "latitude", "longitude"])
 
-    frames: list[pd.DataFrame] = []
-    for psr_id in station_lookup["project_system_record_id"].tolist():
-        try:
-            assets = get_edna_assets(hdr, project_system_record_id=psr_id)
-        except Exception:
-            continue
-        if not assets.empty:
-            assets = assets.copy()
-            assets["project_system_record_id"] = psr_id
-            frames.append(assets)
-
-    if not frames:
+    if merged.empty:
         return station_lookup.reset_index(drop=True)
 
-    merged = pd.concat(frames, ignore_index=True, sort=False)
-    merged = _merge_station_lookup(merged, station_lookup)
-    if "data_type" not in merged.columns:
-        merged["data_type"] = "eDNA"
+    if include_iucn_status and "iucn_redlist_status" not in merged.columns:
+        merged = _enrich_with_iucn_status(merged, _build_iucn_map(hdr))
+
     return merged.reset_index(drop=True)
 
 
@@ -793,37 +1035,82 @@ def _normalise_species_frame(df: pd.DataFrame, data_type_fallback: str) -> pd.Da
     return out
 
 
-def get_all_species_observations(hdr: AuthHeaders) -> pd.DataFrame:
-    """Retrieve all species identifications across every measurement type.
+def _normalise_measurement_type_inputs(
+    measurement_types: str | list[str] | tuple[str, ...] | None,
+) -> list[str]:
+    """Normalise user measurement-type input to internal keys."""
+    if measurement_types is None:
+        return list(_MEASUREMENT_TYPE_TO_DATATYPES.keys())
 
-    Calls :func:`get_camera_trap_data`, :func:`get_audio_observation_data`,
-    and :func:`get_edna_observation_data`, normalises their columns, and
-    concatenates the results into a single flat DataFrame.
+    raw = [measurement_types] if isinstance(measurement_types, str) else list(measurement_types)
+    if not raw:
+        return list(_MEASUREMENT_TYPE_TO_DATATYPES.keys())
+    normalised: list[str] = []
+    for value in raw:
+        mt = _normalise_measurement_type(value)
+        if mt is None:
+            return list(_MEASUREMENT_TYPE_TO_DATATYPES.keys())
+        if mt not in _MEASUREMENT_TYPE_TO_DATATYPES:
+            raise ValueError(
+                f"Invalid measurement_type: {value!r}. "
+                f"Must be one of {list(_MEASUREMENT_TYPE_TO_DATATYPES)} or None/'all'."
+            )
+        if mt not in normalised:
+            normalised.append(mt)
+    return normalised
+
+
+def get_species_observations(
+    hdr: AuthHeaders,
+    measurement_types: str | list[str] | tuple[str, ...] | None = None,
+    include_iucn_status: bool = False,
+) -> pd.DataFrame:
+    """Retrieve species observations for one or more measurement-type domains.
 
     Parameters
     ----------
     hdr:
         Authentication context returned by :func:`auth_headers`.
+    measurement_types:
+        A measurement-type key, a sequence of keys, or None/"all".
+        Supported keys are ``"camera"``, ``"bioacoustic"``, and ``"edna"``.
+    include_iucn_status:
+        If ``True``, attach IUCN Red List status to the merged output.
 
     Returns
     -------
     pandas.DataFrame
-        A DataFrame with at least the columns listed in ``_SPECIES_OBS_CORE_COLUMNS``.
-        Additional columns from each source are preserved.
+        A DataFrame containing merged observations across requested domains.
 
     Examples
     --------
-    >>> obs = get_all_species_observations(hdr)  # doctest: +SKIP
+    >>> obs = get_species_observations(hdr, "all")  # doctest: +SKIP
+    >>> obs = get_species_observations(hdr, ["camera", "bioacoustic"])  # doctest: +SKIP
+    >>> obs = get_species_observations(hdr, include_iucn_status=True)  # doctest: +SKIP
     """
-    frames = [
-        _normalise_species_frame(get_camera_trap_data(hdr), "image"),
-        _normalise_species_frame(get_audio_observation_data(hdr), "audio"),
-        _normalise_species_frame(get_edna_observation_data(hdr), "eDNA"),
-    ]
+    requested = _normalise_measurement_type_inputs(measurement_types)
+    frames: list[pd.DataFrame] = []
+
+    for mt in requested:
+        if mt == "camera":
+            frame = get_camera_trap_data(hdr, include_iucn_status=False)
+            fallback = "image"
+        elif mt == "bioacoustic":
+            frame = get_audio_observation_data(hdr, include_iucn_status=False)
+            fallback = "audio"
+        else:
+            frame = get_edna_observation_data(hdr)
+            fallback = "eDNA"
+        frames.append(_normalise_species_frame(frame, fallback))
+
     non_empty = [f for f in frames if not f.empty]
     if not non_empty:
         return _EMPTY_OBSERVATION_FRAME.copy()
-    return pd.concat(non_empty, ignore_index=True, sort=False)
+
+    result = pd.concat(non_empty, ignore_index=True, sort=False)
+    if include_iucn_status:
+        result = _enrich_with_iucn_status(result, _build_iucn_map(hdr))
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -854,11 +1141,16 @@ def _build_iucn_map(hdr: AuthHeaders) -> dict[str, str | None]:
     ``getattr`` call below accordingly.
     """
     iucn_table = get_iucn_labels(hdr, offset=0, limit=20_000)
-    iucn_map = {
-        _normalise_species_name(item.species): getattr(item, "iucn_redlist_status", None)
-        for item in iucn_table.table
-        if getattr(item, "species", None)
-    }
+    iucn_map: dict[str, str | None] = {}
+    for item in iucn_table.table:
+        status = getattr(item, "iucn_redlist_status", None)
+        species_name = getattr(item, "species", None)
+        label_name = getattr(item, "label", None)
+
+        if species_name:
+            iucn_map[_normalise_species_name(species_name)] = status
+        if label_name:
+            iucn_map[_normalise_species_name(label_name)] = status
     if not iucn_map:
         print(
             "Warning: IUCN map is empty. The 'species' attribute may not exist on "
@@ -877,14 +1169,22 @@ def _enrich_with_iucn_status(df: pd.DataFrame, iucn_map: dict[str, str | None]) 
     is returned unchanged. Existing ``iucn_redlist_status`` values are never
     overwritten.
     """
-    if "species" not in df.columns:
+    if "species" not in df.columns and "label" not in df.columns:
         return df
     df = df.copy()
     if "iucn_redlist_status" not in df.columns:
         df["iucn_redlist_status"] = pd.NA
     mask = df["iucn_redlist_status"].isna()
-    normalised_species = df.loc[mask, "species"].dropna().map(_normalise_species_name)
-    df.loc[normalised_species.index, "iucn_redlist_status"] = normalised_species.map(iucn_map)
+
+    if "species" in df.columns:
+        normalised_species = df.loc[mask, "species"].dropna().map(_normalise_species_name)
+        df.loc[normalised_species.index, "iucn_redlist_status"] = normalised_species.map(iucn_map)
+
+    if "label" in df.columns:
+        mask = df["iucn_redlist_status"].isna()
+        normalised_label = df.loc[mask, "label"].dropna().map(_normalise_species_name)
+        df.loc[normalised_label.index, "iucn_redlist_status"] = normalised_label.map(iucn_map)
+
     return df
 
 
@@ -913,19 +1213,28 @@ def get_project_labels(
     --------
     >>> labels = get_project_labels(hdr, "Camera", include_iucn_status=True)  # doctest: +SKIP
     """
-    url = f"{hdr.root}getProjectLabels/{labeltype}/{hdr.key}"
-    response = httpx.get(url, timeout=_DEFAULT_TIMEOUT)
-    response.raise_for_status()
-    labels = [SpeciesLight.model_validate(item) for item in response.json()]
+    raw_labels = _fetch_project_labels_rows(hdr, labeltype)
+    labels = [
+        SpeciesLight.model_validate(item)
+        for item in raw_labels
+    ]
 
     if include_iucn_status and labels:
         iucn_map = _build_iucn_map(hdr)
         for label in labels:
             species = getattr(label, "species", None)
-            if species and hasattr(label, "iucn_redlist_status"):
-                label.iucn_redlist_status = iucn_map.get(species)
+            if species:
+                label.iucn_redlist_status = iucn_map.get(_normalise_species_name(species))
 
     return labels
+
+
+def _fetch_project_labels_rows(hdr: AuthHeaders, labeltype: LabelType) -> list[dict[str, Any]]:
+    """Fetch and normalise project label payload rows."""
+    url = f"{hdr.root}getProjectLabels/{labeltype}/{hdr.key}"
+    response = httpx.get(url, timeout=_DEFAULT_TIMEOUT)
+    response.raise_for_status()
+    return _extract_rows_from_payload(response.json())
 
 
 def get_project_labels_df(
@@ -955,10 +1264,7 @@ def get_project_labels_df(
     >>> labels = get_project_labels_df(hdr, "Camera")  # doctest: +SKIP
     >>> labels = get_project_labels_df(hdr, "Camera", include_iucn_status=True)  # doctest: +SKIP
     """
-    url = f"{hdr.root}getProjectLabels/{labeltype}/{hdr.key}"
-    response = httpx.get(url, timeout=_DEFAULT_TIMEOUT)
-    response.raise_for_status()
-    df = pd.DataFrame(response.json())
+    df = pd.DataFrame(_fetch_project_labels_rows(hdr, labeltype))
     if include_iucn_status and not df.empty:
         df = _enrich_with_iucn_status(df, _build_iucn_map(hdr))
     return df
@@ -1030,7 +1336,7 @@ def get_iucn_labels(
     >>> result = get_iucn_labels(hdr, offset=0, limit=100, search_term="horse")  # doctest: +SKIP
     """
     if limit > 20_000:
-        raise ValueError("limit cannot exceed 20 000.")
+        raise ValueError("limit cannot exceed 20000.")
     params: dict[str, Any] = {"offset": offset, "limit": limit, "search_term": search_term or ""}
     url = f"{hdr.root}getIUCNLabels/{hdr.key}"
     response = httpx.get(url, params=params, timeout=_DEFAULT_TIMEOUT)
@@ -1236,7 +1542,7 @@ def push_new_timestamps(
     """
     n = len(media_metadata)
     if chunksize > n:
-        print(f"chunksize exceeds dataset size; using chunksize={n}.")
+        print(f"chunksize exceeds dataset size; altering chunksize to {n}.")
         chunksize = n
     num_chunks = math.ceil(n / chunksize)
     for i in range(num_chunks):

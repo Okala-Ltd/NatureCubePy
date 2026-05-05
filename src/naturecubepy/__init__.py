@@ -23,6 +23,7 @@ from naturecubepy.api import (
     check_edna_labels,
     check_edna_labels_df,
     get_camera_trap_data,
+    get_audio_data,
     get_audio_observation_data,
     get_iucn_labels,
     get_key,
@@ -30,6 +31,7 @@ from naturecubepy.api import (
     get_media_assets_df,
     get_media_segments,
     get_project,
+    get_species_observations,
     get_project_labels,
     get_project_labels_df,
     get_station_info,
@@ -41,6 +43,7 @@ from naturecubepy.api import (
     update_media_timestamps,
     update_segment_labels,
     upload_edna_records,
+    get_edna_observation_data
 )
 from naturecubepy.schema import (
     AuthHeaders,
@@ -75,12 +78,14 @@ __all__ = [
     "auth_headers",
     "auth_headers_dev",
     "get_project",
+    "get_species_observations",
     "get_station_info",
     "get_stations_typed",
     "plot_stations",
     "get_media_assets",
     "get_media_assets_df",
     "get_camera_trap_data",
+    "get_audio_data",
     "get_audio_observation_data",
     "get_media_segments",
     "get_project_labels",

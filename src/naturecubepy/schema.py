@@ -122,6 +122,7 @@ class SpeciesLight(SpeciesMinimal):
     family: str | None = None
     genus: str | None = None
     species: str | None = None
+    iucn_redlist_status: IUCNStatus | None = None
     tags: list[str] = Field(default_factory=list)
     global_labels_applied: bool | None = True
 
