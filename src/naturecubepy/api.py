@@ -19,7 +19,6 @@ import pandas as pd
 
 from naturecubepy.schema import (
     AuthHeaders,
-    CameraTrapDataRecord,
     DataTypes,
     GetProjectGeometryResponse,
     IUCNSpeciesLabelInput,
@@ -28,7 +27,6 @@ from naturecubepy.schema import (
     MediaRecordAPIFlat,
     MediaTimestampUpdate,
     SegmentRecordAPIFlat,
-    SpeciesLight,
     SpeciesTable,
     StationResponseAPI,
     TimestampUpdateResponse,
@@ -40,15 +38,20 @@ _PROD_URL = "https://naturecube.io/api/"
 _DEV_URL = "http://127.0.0.1:8000/api/"
 _DEFAULT_TIMEOUT = 180.0
 _STATIONS_PAGE_SIZE = 1000
-_MEDIA_FETCH_CHUNK_SIZE = 100
-_RATE_LIMIT_MAX_RETRIES = 4
-_RATE_LIMIT_BACKOFF_SECONDS = 0.5
+_MEDIA_FETCH_CHUNK_SIZE = 50
+_RATE_LIMIT_MAX_RETRIES = 6
+_RATE_LIMIT_BACKOFF_SECONDS = 2.0
+_TIMEOUT_MAX_RETRIES = 3
+_TIMEOUT_BACKOFF_SECONDS = 2.0
+_INTER_REQUEST_DELAY_SECONDS = 0.3
 
 _MEASUREMENT_TYPE_TO_DATATYPES = {
     "camera": ["image", "video"],
     "bioacoustic": ["audio"],
     "edna": ["eDNA"],
 }
+
+_CLASS_COLUMN_NAMES = ["class", "class_", "taxonomic_class", "class_name", "taxon_class"]
 
 # Columns guaranteed to appear in the unified species observation DataFrame.
 _SPECIES_OBS_CORE_COLUMNS: list[str] = [
@@ -62,6 +65,7 @@ _SPECIES_OBS_CORE_COLUMNS: list[str] = [
     "label_id",
     "common_name",
     "species",
+    "class",
     "genus",
     "family",
     "order",
@@ -109,6 +113,24 @@ def _extract_total_count(payload: Any) -> int | None:
         if total >= 0:
             return total
     return None
+
+
+def _standardize_taxonomic_class_column(df: pd.DataFrame) -> pd.DataFrame:
+    """Return a copy whose public taxonomic class column is always named ``class``."""
+    if df.empty:
+        return df.copy()
+
+    out = df.copy()
+    if "class" not in out.columns:
+        for source_name in _CLASS_COLUMN_NAMES[1:]:
+            if source_name in out.columns:
+                out = out.rename(columns={source_name: "class"})
+                break
+
+    if "class_" in out.columns:
+        out = out.drop(columns=["class_"])
+
+    return out
 
 
 def _should_fetch_next_page(payload: Any, fetched_count: int, offset: int, limit: int) -> bool:
@@ -511,7 +533,7 @@ def _fetch_paginated_rows_for_psr_ids(
     *,
     error_label: str | None = None,
 ) -> list[dict[str, Any]]:
-    """Fetch paginated rows for PSR IDs using consistent chunked requests."""
+    """Fetch paginated rows for PSR IDs using sequential chunked requests with 429 backoff."""
     psr_ids = _normalise_psr_ids(project_system_record_ids)
     chunk_size = _MEDIA_FETCH_CHUNK_SIZE
     limit = 1000
@@ -524,17 +546,46 @@ def _fetch_paginated_rows_for_psr_ids(
         while True:
             params = {"offset": offset, "limit": limit}
             response: httpx.Response | None = None
-            try:
-                response = httpx.post(url, json=chunk, params=params, timeout=_DEFAULT_TIMEOUT)
-                response.raise_for_status()
-            except Exception as exc:
-                if error_label is not None:
-                    print(
-                        f"Error fetching {error_label}: {exc}\n"
-                        f"Payload: {chunk}\n"
-                        f"Response: {getattr(response, 'text', '')}"
-                    )
-                raise
+
+            for attempt in range(_RATE_LIMIT_MAX_RETRIES + 1):
+                try:
+                    response = httpx.post(url, json=chunk, params=params, timeout=_DEFAULT_TIMEOUT)
+                    if response.status_code == 429:
+                        if attempt >= _RATE_LIMIT_MAX_RETRIES:
+                            response.raise_for_status()
+                        retry_after = response.headers.get("Retry-After")
+                        try:
+                            delay = float(retry_after) if retry_after is not None else 0.0
+                        except (TypeError, ValueError):
+                            delay = 0.0
+                        if delay <= 0:
+                            delay = _RATE_LIMIT_BACKOFF_SECONDS * (2 ** attempt)
+                        if error_label is not None:
+                            print(f"Rate limited (attempt {attempt + 1}), waiting {delay:.1f}s...")
+                        time.sleep(delay)
+                        continue
+                    response.raise_for_status()
+                    break
+                except httpx.TimeoutException:
+                    if attempt >= _TIMEOUT_MAX_RETRIES:
+                        if error_label is not None:
+                            print(f"Timeout fetching {error_label} after {_TIMEOUT_MAX_RETRIES + 1} attempts.")
+                        raise
+                    delay = _TIMEOUT_BACKOFF_SECONDS * (2 ** attempt)
+                    time.sleep(delay)
+                except httpx.HTTPStatusError:
+                    raise
+                except Exception as exc:
+                    if error_label is not None:
+                        print(
+                            f"Error fetching {error_label}: {exc}\n"
+                            f"Payload: {chunk}\n"
+                            f"Response: {getattr(response, 'text', '')}"
+                        )
+                    raise
+
+            if response is None:
+                break
 
             payload = response.json()
             items = _extract_rows_from_payload(payload)
@@ -545,6 +596,10 @@ def _fetch_paginated_rows_for_psr_ids(
             if not _should_fetch_next_page(payload, fetched_count=len(items), offset=offset, limit=limit):
                 break
             offset += len(items)
+
+        # Polite delay between chunks to stay under the rate limit.
+        if i + chunk_size < len(psr_ids):
+            time.sleep(_INTER_REQUEST_DELAY_SECONDS)
 
     return all_results
 
@@ -841,17 +896,13 @@ def get_camera_trap_data(
         merged, _ = _fetch_observations_for_datatype(hdr, datatype, stations)
         if merged.empty:
             continue
-
-        validated = [
-            CameraTrapDataRecord.model_validate(row).model_dump(mode="json", by_alias=True)
-            for row in merged.to_dict(orient="records")
-        ]
-        frames.append(pd.DataFrame(validated))
+        frames.append(merged)
 
     if not frames:
         return pd.DataFrame(columns=_STATION_LOOKUP_COLUMNS)
 
     result = pd.concat(frames, ignore_index=True, sort=False)
+    result = _standardize_taxonomic_class_column(result)
     if include_iucn_status:
         result = _enrich_with_iucn_status(result, _build_iucn_map(hdr))
     return result
@@ -890,6 +941,7 @@ def get_audio_observation_data(
         return pd.DataFrame(columns=_STATION_LOOKUP_COLUMNS)
     if merged.empty:
         return station_lookup.drop(columns=["latitude", "longitude"], errors="ignore")
+    merged = _standardize_taxonomic_class_column(merged)
     if include_iucn_status:
         merged = _enrich_with_iucn_status(merged, _build_iucn_map(hdr))
     return merged.reset_index(drop=True)
@@ -1013,6 +1065,8 @@ def get_edna_observation_data(
     if merged.empty:
         return station_lookup.reset_index(drop=True)
 
+    merged = _standardize_taxonomic_class_column(merged)
+
     if include_iucn_status and "iucn_redlist_status" not in merged.columns:
         merged = _enrich_with_iucn_status(merged, _build_iucn_map(hdr))
 
@@ -1024,7 +1078,7 @@ def _normalise_species_frame(df: pd.DataFrame, data_type_fallback: str) -> pd.Da
     if df.empty:
         return _EMPTY_OBSERVATION_FRAME.copy()
 
-    out = df.copy()
+    out = _standardize_taxonomic_class_column(df)
     if "label" not in out.columns:
         out["label"] = out["species"] if "species" in out.columns else pd.NA
     if "data_type" not in out.columns:
@@ -1192,8 +1246,8 @@ def get_project_labels(
     hdr: AuthHeaders,
     labeltype: LabelType,
     include_iucn_status: bool = False,
-) -> list[SpeciesLight]:
-    """Retrieve project-specific labels, optionally enriched with IUCN status.
+) -> pd.DataFrame:
+    """Retrieve project-specific labels as a DataFrame.
 
     Parameters
     ----------
@@ -1206,27 +1260,19 @@ def get_project_labels(
 
     Returns
     -------
-    list[SpeciesLight]
-        A list of project labels with species information.
+    pandas.DataFrame
+        A DataFrame containing project labels, with an optional
+        ``iucn_redlist_status`` column when ``include_iucn_status=True``.
 
     Examples
     --------
+    >>> labels = get_project_labels(hdr, "Camera")  # doctest: +SKIP
     >>> labels = get_project_labels(hdr, "Camera", include_iucn_status=True)  # doctest: +SKIP
     """
-    raw_labels = _fetch_project_labels_rows(hdr, labeltype)
-    labels = [
-        SpeciesLight.model_validate(item)
-        for item in raw_labels
-    ]
-
-    if include_iucn_status and labels:
-        iucn_map = _build_iucn_map(hdr)
-        for label in labels:
-            species = getattr(label, "species", None)
-            if species:
-                label.iucn_redlist_status = iucn_map.get(_normalise_species_name(species))
-
-    return labels
+    df = pd.DataFrame(_fetch_project_labels_rows(hdr, labeltype))
+    if include_iucn_status and not df.empty:
+        df = _enrich_with_iucn_status(df, _build_iucn_map(hdr))
+    return df
 
 
 def _fetch_project_labels_rows(hdr: AuthHeaders, labeltype: LabelType) -> list[dict[str, Any]]:
@@ -1235,39 +1281,6 @@ def _fetch_project_labels_rows(hdr: AuthHeaders, labeltype: LabelType) -> list[d
     response = httpx.get(url, timeout=_DEFAULT_TIMEOUT)
     response.raise_for_status()
     return _extract_rows_from_payload(response.json())
-
-
-def get_project_labels_df(
-    hdr: AuthHeaders,
-    labeltype: LabelType,
-    include_iucn_status: bool = False,
-) -> pd.DataFrame:
-    """Retrieve project-specific labels as a DataFrame.
-
-    Parameters
-    ----------
-    hdr:
-        Authentication context returned by :func:`auth_headers`.
-    labeltype:
-        One of ``"Bioacoustic"``, ``"Camera"``, or ``"Observation"``.
-    include_iucn_status:
-        If ``True``, add an ``iucn_redlist_status`` column joined on ``species``.
-
-    Returns
-    -------
-    pandas.DataFrame
-        A DataFrame containing project labels, with an optional
-        ``iucn_redlist_status`` column when ``include_iucn_status=True``.
-
-    Examples
-    --------
-    >>> labels = get_project_labels_df(hdr, "Camera")  # doctest: +SKIP
-    >>> labels = get_project_labels_df(hdr, "Camera", include_iucn_status=True)  # doctest: +SKIP
-    """
-    df = pd.DataFrame(_fetch_project_labels_rows(hdr, labeltype))
-    if include_iucn_status and not df.empty:
-        df = _enrich_with_iucn_status(df, _build_iucn_map(hdr))
-    return df
 
 
 def add_project_labels(
@@ -1634,7 +1647,7 @@ def check_edna_labels_df(hdr: AuthHeaders, edna_data: pd.DataFrame) -> pd.DataFr
     url = f"{hdr.root}checkeDNALabels/{hdr.key}"
     response = httpx.post(url, json=records, timeout=_DEFAULT_TIMEOUT)
     response.raise_for_status()
-    result = pd.DataFrame(response.json())
+    result = _standardize_taxonomic_class_column(pd.DataFrame(response.json()))
     print(f"Validated {len(result)} eDNA records.")
     return result
 

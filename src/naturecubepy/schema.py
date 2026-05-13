@@ -115,7 +115,7 @@ class SpeciesMinimal(BaseModel):
 class SpeciesLight(SpeciesMinimal):
     """Light species information with taxonomy."""
 
-    model_config = ConfigDict(populate_by_name=True)
+    model_config = ConfigDict(populate_by_name=True, serialize_by_alias=True)
 
     class_: str | None = Field(default=None, alias="class")
     order: str | None = None
@@ -305,7 +305,7 @@ class eDNATable(SpeciesLight, MarkerRecord):
 class eDNAUploadSchema(BaseModel):
     """Schema for uploading eDNA records."""
 
-    model_config = ConfigDict(populate_by_name=True)
+    model_config = ConfigDict(populate_by_name=True, serialize_by_alias=True)
 
     marker_reference_name: str = Field(alias="marker_name")
     genetic_sequence: str = Field(alias="sequence")
@@ -356,7 +356,7 @@ class eDNAUploadResponse(eDNAUploadSchema):
 class IUCNSpeciesLabelEdit(BaseModel):
     """Schema for editing IUCN species labels."""
 
-    model_config = ConfigDict(populate_by_name=True)
+    model_config = ConfigDict(populate_by_name=True, serialize_by_alias=True)
 
     kingdom: str | None = None
     phylum: str | None = None

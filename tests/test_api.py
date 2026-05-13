@@ -34,7 +34,7 @@ from naturecubepy.api import (
     update_media_timestamps,
     upload_edna_records,
 )
-from naturecubepy.schema import Label, MediaTimestampUpdate, eDNAUploadResponse
+from naturecubepy.schema import Label, MediaTimestampUpdate, SpeciesLight, eDNAUploadResponse
 
 
 # ---------------------------------------------------------------------------
@@ -207,7 +207,7 @@ class TestGetStationInfo:
 class TestGetSpeciesObservations:
     def test_combines_requested_domains(self, hdr):
         camera_df = pd.DataFrame([{"species": "Panthera leo", "data_type": "image", "project_system_record_id": 1}])
-        edna_df = pd.DataFrame([{"species": "Canis lupus", "data_type": "eDNA", "project_system_record_id": 2}])
+        edna_df = pd.DataFrame([{"species": "Canis lupus", "data_type": "eDNA", "project_system_record_id": 2, "class_": "Mammalia"}])
 
         with (
             patch("naturecubepy.api.get_camera_trap_data", return_value=camera_df),
@@ -219,6 +219,8 @@ class TestGetSpeciesObservations:
         assert set(result["data_type"]) == {"image", "eDNA"}
         assert "latitude" in result.columns
         assert "longitude" in result.columns
+        assert "class" in result.columns
+        assert "class_" not in result.columns
 
     def test_raises_for_invalid_measurement_type(self, hdr):
         with pytest.raises(ValueError, match="Invalid measurement_type"):
@@ -536,19 +538,15 @@ class TestGetEdnaObservationData:
 
 class TestGetProjectLabels:
     def test_returns_dataframe(self, hdr):
-        validated_label = MagicMock()
         mock_response = MagicMock()
         mock_response.raise_for_status = MagicMock()
         mock_response.json.return_value = [
             {"label_id": 1, "label": "Robin"},
         ]
-        with (
-            patch("naturecubepy.api.httpx.get", return_value=mock_response),
-            patch("naturecubepy.api.SpeciesLight.model_validate", return_value=validated_label),
-        ):
+        with patch("naturecubepy.api.httpx.get", return_value=mock_response):
             result = get_project_labels(hdr, "Bioacoustic")
-        assert isinstance(result, list)
-        assert result[0] is validated_label
+        assert isinstance(result, pd.DataFrame)
+        assert result.loc[0, "label"] == "Robin"
 
 
 # ---------------------------------------------------------------------------
@@ -777,9 +775,11 @@ class TestCheckEdnaLabels:
         mock_response.raise_for_status = MagicMock()
         mock_response.json.return_value = [{"status": "success"}]
         with patch("naturecubepy.api.httpx.post", return_value=mock_response) as mock_post:
-            check_edna_labels_df(hdr, df)
+            result = check_edna_labels_df(hdr, df)
         payload = mock_post.call_args.kwargs["json"]
         assert payload[0].get("class") == "Mammalia"
+        assert "class" in result.columns
+        assert "class_" not in result.columns
 
 
 # ---------------------------------------------------------------------------
@@ -848,3 +848,11 @@ class TestUploadEdnaRecords:
         ]
         with pytest.raises(ValueError, match="No successful records"):
             upload_edna_records(hdr, df, project_system_record_id=1)
+
+
+class TestTaxonomySerialization:
+    def test_species_light_model_dump_uses_class_alias(self):
+        species = SpeciesLight(label_id=1, label="Panthera leo", class_="Mammalia")
+        dumped = species.model_dump()
+        assert "class" in dumped
+        assert "class_" not in dumped

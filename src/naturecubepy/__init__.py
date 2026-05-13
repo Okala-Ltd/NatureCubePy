@@ -33,7 +33,6 @@ from naturecubepy.api import (
     get_project,
     get_species_observations,
     get_project_labels,
-    get_project_labels_df,
     get_station_info,
     get_stations_typed,
     plot_stations,
@@ -71,6 +70,12 @@ from naturecubepy.phone_observations import (
     upload_phone_observations,
     validate_observation_payload,
 )
+from naturecubepy.report_builder import (
+    ReportBuildResult,
+    build_core_report_text,
+    generate_reports,
+    render_final_docx,
+)
 
 __all__ = [
     # api
@@ -89,7 +94,6 @@ __all__ = [
     "get_audio_observation_data",
     "get_media_segments",
     "get_project_labels",
-    "get_project_labels_df",
     "add_project_labels",
     "get_iucn_labels",
     "add_iucn_labels",
@@ -125,4 +129,9 @@ __all__ = [
     "build_feature_record",
     "validate_observation_payload",
     "upload_phone_observations",
+    # report_builder
+    "ReportBuildResult",
+    "build_core_report_text",
+    "generate_reports",
+    "render_final_docx",
 ]
