@@ -70,6 +70,12 @@ from naturecubepy.phone_observations import (
     upload_phone_observations,
     validate_observation_payload,
 )
+from naturecubepy.analysis import ObservationBundle, load_project_data, save_observation_bundle
+from naturecubepy.report_builder import (
+    ReportBuildResult,
+    build_core_report_text,
+    generate_reports,
+)
 
 
 __all__ = [
@@ -127,9 +133,11 @@ __all__ = [
     "build_feature_record",
     "validate_observation_payload",
     "upload_phone_observations",
-    # report_builder
+    # analysis / report assets
+    "ObservationBundle",
+    "load_project_data",
+    "save_observation_bundle",
     "ReportBuildResult",
     "build_core_report_text",
     "generate_reports",
-    "render_final_docx",
 ]

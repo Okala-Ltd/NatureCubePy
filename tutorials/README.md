@@ -7,6 +7,8 @@ Step-by-step guides for using NatureCubePy with the Okala API.
 | Tutorial | Format | Description |
 |----------|--------|-------------|
 | [01 - Authentication](01_authentication.ipynb) | Notebook | Set up API keys and connect to Okala |
+| [02 - Data Retrieval](02_data_retrieval.ipynb) | Notebook | Retrieve stations, labels, and observation datasets |
+| [03 - Visualization and Tables](03_visualization_and_tables.ipynb) | Notebook | Build requested plots and reporting tables |
 | [01 - Authentication](01_authentication.md) | Markdown | Text reference for authentication |
 
 ## Requirements

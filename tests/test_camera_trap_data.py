@@ -108,3 +108,34 @@ def test_get_camera_trap_data_raises_when_station_ids_missing(hdr):
     with patch("naturecubepy.api.get_station_info", return_value=stations):
         with pytest.raises(ValueError, match="project_system_record_id"):
             get_camera_trap_data(hdr)
+
+
+def test_get_camera_trap_data_accepts_list_segment_payload(hdr):
+    stations = _station_frame(101, "image", 12.1, -0.1)
+
+    def fake_get_station_info(_hdr, measurement_type):
+        assert measurement_type == "camera"
+        return stations
+
+    def fake_get_media_assets_df(_hdr, datatype, project_system_record_ids=None):
+        psr_ids = project_system_record_ids or []
+        return pd.DataFrame([_media_record(int(psr_ids[0]), 1).model_dump(mode="json")])
+
+    def fake_get_media_segments(_hdr, datatype, project_system_record_ids=None):
+        return [
+            {
+                "segment_record_id": 1,
+                "segment_note": "note-image",
+                "manager_verified": True,
+            }
+        ]
+
+    with (
+        patch("naturecubepy.api.get_station_info", side_effect=fake_get_station_info),
+        patch("naturecubepy.api.get_media_assets_df", side_effect=fake_get_media_assets_df),
+        patch("naturecubepy.api.get_media_segments", side_effect=fake_get_media_segments),
+    ):
+        result = get_camera_trap_data(hdr)
+
+    assert not result.empty
+    assert result["segment_note"].iloc[0] == "note-image"

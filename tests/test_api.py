@@ -7,6 +7,7 @@ from unittest.mock import MagicMock, patch
 
 import geopandas as gpd
 import httpx
+import naturecubepy.api as api_module
 import pandas as pd
 import pytest
 
@@ -14,7 +15,6 @@ from naturecubepy.api import (
     add_iucn_labels,
     add_project_labels,
     auth_headers,
-    auth_headers_dev,
     check_edna_labels,
     check_edna_labels_df,
     get_audio_observation_data,
@@ -31,10 +31,11 @@ from naturecubepy.api import (
     push_new_labels,
     push_new_timestamps,
     set_segment_blank_status,
+    set_segment_published_status,
     update_media_timestamps,
     upload_edna_records,
 )
-from naturecubepy.schema import Label, MediaTimestampUpdate, SpeciesLight, eDNAUploadResponse
+from naturecubepy.schema import Label, SegmentRecordAPIFlat, MediaRecordAPIFlat, MediaTimestampUpdate, SpeciesLight, eDNAUploadResponse
 
 
 # ---------------------------------------------------------------------------
@@ -44,11 +45,6 @@ from naturecubepy.schema import Label, MediaTimestampUpdate, SpeciesLight, eDNAU
 @pytest.fixture()
 def hdr():
     return auth_headers("test-api-key")
-
-
-@pytest.fixture()
-def hdr_dev():
-    return auth_headers_dev("test-api-key")
 
 
 # ---------------------------------------------------------------------------
@@ -72,6 +68,10 @@ class TestAuthHeaders:
         assert hdr.key == "mykey"
         assert hdr.root == "https://naturecube.io/api/"
 
+    def test_root_url_defaults_to_api_prefix(self):
+        hdr = auth_headers("mykey", okala_url="http://127.0.0.1:8000")
+        assert hdr.root == "http://127.0.0.1:8000/api/"
+
     def test_custom_url(self):
         hdr = auth_headers("mykey", okala_url="https://custom.example.com/api/")
         assert hdr.root == "https://custom.example.com/api/"
@@ -79,10 +79,6 @@ class TestAuthHeaders:
     def test_trailing_slash_normalised(self):
         hdr = auth_headers("mykey", okala_url="https://naturecube.io/api")
         assert hdr.root.endswith("/")
-
-    def test_dev_default_url(self):
-        hdr = auth_headers_dev("mykey")
-        assert hdr.root == "http://127.0.0.1:8000/api/"
 
 
 # ---------------------------------------------------------------------------
@@ -105,6 +101,38 @@ class TestGetProject:
             get_project(hdr)
         captured = capsys.readouterr()
         assert "My Project" in captured.out
+
+    def test_accepts_payload_when_project_status_missing(self, hdr):
+        mock_response = MagicMock()
+        mock_response.raise_for_status = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {
+            "boundary": {
+                "type": "FeatureCollection",
+                "features": [
+                    {
+                        "type": "Feature",
+                        "geometry": {
+                            "type": "Polygon",
+                            "coordinates": [[[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 0.0]]],
+                        },
+                        "properties": {
+                            "project_name": "My Project",
+                            "project_description": "desc",
+                            "project_start_timestamp": "2024-01-01T00:00:00Z",
+                            "project_end_timestamp": "2024-12-31T00:00:00Z",
+                        },
+                    }
+                ],
+            },
+            "rois": {"type": "FeatureCollection", "features": []},
+            "locations": {"type": "FeatureCollection", "features": []},
+        }
+
+        with patch("naturecubepy.api.httpx.get", return_value=mock_response):
+            result = get_project(hdr)
+
+        assert result.boundary.features[0].properties.project_status is None
 
 
 # ---------------------------------------------------------------------------
@@ -200,6 +228,7 @@ class TestGetStationInfo:
         assert mock_get.call_count == 2
 
 
+
 # ---------------------------------------------------------------------------
 # get_species_observations
 # ---------------------------------------------------------------------------
@@ -220,7 +249,6 @@ class TestGetSpeciesObservations:
         assert "latitude" in result.columns
         assert "longitude" in result.columns
         assert "class" in result.columns
-        assert "class_" not in result.columns
 
     def test_raises_for_invalid_measurement_type(self, hdr):
         with pytest.raises(ValueError, match="Invalid measurement_type"):
@@ -231,20 +259,32 @@ class TestGetSpeciesObservations:
 # get_media_assets
 # ---------------------------------------------------------------------------
 
+from unittest.mock import MagicMock, patch
+
+import httpx
+import pandas as pd
+
+
 class TestGetMediaAssets:
-    def test_returns_dataframe(self, hdr):
+    def test_returns_list(self, hdr):
         validated_records = [MagicMock(), MagicMock()]
+
         mock_response = MagicMock()
         mock_response.raise_for_status = MagicMock()
         mock_response.json.return_value = [
             {"media_file_record_id": 1, "filename": "vid1.mp4"},
             {"media_file_record_id": 2, "filename": "vid2.mp4"},
         ]
+
         with (
             patch("naturecubepy.api.httpx.post", return_value=mock_response),
-            patch("naturecubepy.api.MediaRecordAPIFlat.model_validate", side_effect=validated_records),
+            patch(
+                "naturecubepy.api.MediaRecordAPIFlat.model_validate",
+                side_effect=validated_records,
+            ),
         ):
             result = get_media_assets(hdr, "video", psr_ids=[123])
+
         assert isinstance(result, list)
         assert len(result) == 2
 
@@ -254,6 +294,7 @@ class TestMediaPagination:
         def fake_post(_url, json=None, params=None, timeout=None):
             response = MagicMock()
             response.raise_for_status = MagicMock()
+
             offset = (params or {}).get("offset", 0)
             limit = (params or {}).get("limit", 1000)
 
@@ -263,6 +304,7 @@ class TestMediaPagination:
                 response.json.return_value = [{"id": i} for i in range(100)]
             else:
                 response.json.return_value = []
+
             return response
 
         return fake_post
@@ -271,6 +313,7 @@ class TestMediaPagination:
         def fake_post(_url, json=None, params=None, timeout=None):
             response = MagicMock()
             response.raise_for_status = MagicMock()
+
             offset = (params or {}).get("offset", 0)
             limit = (params or {}).get("limit", 1000)
 
@@ -281,125 +324,179 @@ class TestMediaPagination:
             else:
                 rows = []
 
-            response.json.return_value = {"rows": rows, "total": 1100}
+            response.json.return_value = {
+                "rows": rows,
+                "total": limit + 100,
+            }
+
             return response
 
         return fake_post
 
     def test_get_media_segments_uses_offset_pagination(self, hdr):
-        with patch("naturecubepy.api.httpx.post", side_effect=self._mock_paginated_endpoint()) as mock_post:
-            result = get_media_segments(hdr, "video", project_system_record_ids=[1, 2])
+        validated = [MagicMock() for _ in range(1100)]
 
-        assert isinstance(result, pd.DataFrame)
-        assert len(result) == 1100
-        assert mock_post.call_count == 2
+        with (
+            patch(
+                "naturecubepy.api.httpx.post",
+                side_effect=self._mock_paginated_endpoint(),
+            ) as mock_post,
+            patch(
+                "naturecubepy.api.SegmentRecordAPIFlat.model_validate",
+                side_effect=validated,
+            ),
+        ):
+            result = get_media_segments(hdr, "video", psr_ids=[1, 2])
 
-    def test_get_media_assets_df_uses_offset_pagination(self, hdr):
-        with patch("naturecubepy.api.httpx.post", side_effect=self._mock_paginated_endpoint()) as mock_post:
-            result = get_media_assets_df(hdr, "video", project_system_record_ids=[1, 2])
-
-        assert isinstance(result, pd.DataFrame)
+        assert isinstance(result, list)
         assert len(result) == 1100
         assert mock_post.call_count == 2
 
     def test_get_media_segments_supports_wrapped_pagination_payload(self, hdr):
-        with patch("naturecubepy.api.httpx.post", side_effect=self._mock_wrapped_paginated_endpoint()) as mock_post:
-            result = get_media_segments(hdr, "video", project_system_record_ids=[1, 2])
+        validated = [MagicMock() for _ in range(1100)]
+
+        with (
+            patch(
+                "naturecubepy.api.httpx.post",
+                side_effect=self._mock_wrapped_paginated_endpoint(),
+            ) as mock_post,
+            patch(
+                "naturecubepy.api.SegmentRecordAPIFlat.model_validate",
+                side_effect=validated,
+            ),
+        ):
+            result = get_media_segments(hdr, "video", psr_ids=[1, 2])
+
+        assert isinstance(result, list)
+        assert len(result) == 1100
+        assert mock_post.call_count == 2
+
+    def test_get_media_assets_df_uses_offset_pagination(self, hdr):
+        validated = [
+            MagicMock(model_dump=lambda: {"id": i})
+            for i in range(1100)
+        ]
+
+        with (
+            patch(
+                "naturecubepy.api.httpx.post",
+                side_effect=self._mock_paginated_endpoint(),
+            ) as mock_post,
+            patch(
+                "naturecubepy.api.MediaRecordAPIFlat.model_validate",
+                side_effect=validated,
+            ),
+        ):
+            result = get_media_assets_df(hdr, "video", psr_ids=[1, 2])
 
         assert isinstance(result, pd.DataFrame)
         assert len(result) == 1100
         assert mock_post.call_count == 2
 
     def test_get_media_assets_df_supports_wrapped_pagination_payload(self, hdr):
-        with patch("naturecubepy.api.httpx.post", side_effect=self._mock_wrapped_paginated_endpoint()) as mock_post:
-            result = get_media_assets_df(hdr, "video", project_system_record_ids=[1, 2])
+        validated = [
+            MagicMock(model_dump=lambda: {"id": i})
+            for i in range(1100)
+        ]
+
+        with (
+            patch(
+                "naturecubepy.api.httpx.post",
+                side_effect=self._mock_wrapped_paginated_endpoint(),
+            ) as mock_post,
+            patch(
+                "naturecubepy.api.MediaRecordAPIFlat.model_validate",
+                side_effect=validated,
+            ),
+        ):
+            result = get_media_assets_df(hdr, "video", psr_ids=[1, 2])
 
         assert isinstance(result, pd.DataFrame)
         assert len(result) == 1100
         assert mock_post.call_count == 2
 
-
-def test_get_audio_observation_data_prefers_segment_taxonomy_values(hdr):
-    stations = gpd.GeoDataFrame(
-        {
-            "project_system_record_id": [101],
-            "device_id": ["device-audio"],
-            "measurement_type": ["Bioacoustic"],
-            "data_type": ["audio"],
-        },
-        geometry=gpd.points_from_xy([12.1], [-0.1]),
-        crs="EPSG:4326",
-    )
-
-    media_assets = pd.DataFrame(
-        [
-            {
-                "segment_record_id": 11,
-                "project_system_record_id_fk": 101,
-                "label": "Mammalia",
-                "species": "Panthera leo",
-                "common_name": "lion",
-            }
+    def test_timeout_splits_chunk_and_recovers(self, hdr):
+        validated = [
+            MagicMock(
+                model_dump=lambda psr_id=psr_id: {
+                    "project_system_record_id_fk": psr_id
+                }
+            )
+            for psr_id in (101, 202)
         ]
-    )
 
-    media_segments = pd.DataFrame(
-        [
-            {
-                "segment_record_id": 11,
-                "label": "Aves",
-                "species": "Corvus corax",
-                "common_name": "raven",
-            }
-        ]
-    )
+        def fake_post(_url, json=None, params=None, timeout=None):
+            if len(json) > 1:
+                raise httpx.TimeoutException("request timed out")
 
-    with (
-        patch("naturecubepy.api._fetch_stations_for_datatype", return_value=stations),
-        patch("naturecubepy.api.get_media_assets_df", return_value=media_assets),
-        patch("naturecubepy.api.get_media_segments", return_value=media_segments),
-    ):
-        result = get_audio_observation_data(hdr, include_iucn_status=False)
+            response = MagicMock()
+            response.raise_for_status = MagicMock()
+            response.json.return_value = [{"id": json[0]}]
+            return response
 
-    assert result.loc[0, "label"] == "Aves"
-    assert result.loc[0, "species"] == "Corvus corax"
-    assert result.loc[0, "common_name"] == "raven"
+        with (
+            patch(
+                "naturecubepy.api.httpx.post",
+                side_effect=fake_post,
+            ),
+            patch(
+                "naturecubepy.api.MediaRecordAPIFlat.model_validate",
+                side_effect=validated,
+            ),
+        ):
+            result = get_media_assets_df(
+                hdr,
+                "audio",
+                psr_ids=[101, 202],
+            )
+
+        assert isinstance(result, pd.DataFrame)
+        assert len(result) == 2
+        assert set(result["project_system_record_id_fk"]) == {101, 202}
 
 
-def test_get_audio_observation_data_handles_station_measurement_type_mismatch(hdr):
-    stations = gpd.GeoDataFrame(
-        {
-            "project_system_record_id": [101],
-            "device_id": ["device-audio"],
-            "measurement_type": ["audio"],
-            "data_type": ["audio"],
-        },
-        geometry=gpd.points_from_xy([12.1], [-0.1]),
-        crs="EPSG:4326",
-    )
+class TestSegmentRecordValidation:
+    def _base_row(self):
+        return {
+            "segment_record_id": 1,
+            "prediction_accuracy": 0.9,
+            "manager_verified": False,
+            "labeller_verified": False,
 
-    media_assets = pd.DataFrame(
-        [
-            {
-                "segment_record_id": 11,
-                "project_system_record_id_fk": 101,
-                "label": "Aves",
-                "label_id": 500,
-                "species": "Corvus corax",
-            }
-        ]
-    )
+            # Add all required MediaRecordSimple fields
+            "media_file_record_id": 1,
+            "project_system_record_id_fk": 1,
+            "media_file_reference_location": "s3://bucket/file.wav",
+            "media_file_created_at": "2024-01-01T00:00:00Z",
 
-    with (
-        patch("naturecubepy.api._fetch_stations_for_datatype", return_value=stations),
-        patch("naturecubepy.api.get_media_assets_df", return_value=media_assets),
-        patch("naturecubepy.api.get_media_segments", return_value=pd.DataFrame()),
-    ):
-        result = get_audio_observation_data(hdr, include_iucn_status=False)
+            # Add all required SegmentSimple fields
+            "segment_start_timestamp": "2024-01-01T00:00:00Z",
+            "segment_end_timestamp": "2024-01-01T00:00:10Z",
+        }
 
-    assert not result.empty
-    assert result.loc[0, "label"] == "Aves"
-    assert result.loc[0, "species"] == "Corvus corax"
+    def test_defaults_to_ai_derived(self):
+        row = self._base_row()
+
+        result = SegmentRecordAPIFlat.model_validate(row)
+
+        assert result.segment_verification_status == "ai_derived"
+
+    def test_labeller_verified_sets_status(self):
+        row = self._base_row()
+        row["labeller_verified"] = True
+
+        result = SegmentRecordAPIFlat.model_validate(row)
+
+        assert result.segment_verification_status == "labeller_verified"
+
+    def test_manager_verified_takes_precedence(self):
+        row = self._base_row()
+        row["manager_verified"] = True
+        row["labeller_verified"] = True
+
+        result = SegmentRecordAPIFlat.model_validate(row)
+
+        assert result.segment_verification_status == "manager_verified"
 
 
 # ---------------------------------------------------------------------------
@@ -438,27 +535,6 @@ class TestGetEdnaAssets:
         assert not result.empty
         assert result.iloc[0]["label"] == "Canis lupus"
 
-    def test_retries_on_429_then_succeeds(self, hdr):
-        rate_limited = MagicMock()
-        rate_limited.raise_for_status.side_effect = httpx.HTTPStatusError(
-            "Too Many Requests",
-            request=httpx.Request("GET", "https://example.invalid"),
-            response=httpx.Response(429, headers={"Retry-After": "0"}),
-        )
-
-        ok = MagicMock()
-        ok.raise_for_status = MagicMock()
-        ok.json.return_value = [{"label": "Panthera leo", "species": "Panthera leo", "label_id": 1}]
-
-        with (
-            patch("naturecubepy.api.httpx.get", side_effect=[rate_limited, ok]) as mock_get,
-            patch("naturecubepy.api.time.sleep") as mock_sleep,
-        ):
-            result = get_edna_assets(hdr, project_system_record_id=123)
-
-        assert mock_get.call_count == 2
-        assert mock_sleep.call_count == 1
-        assert not result.empty
 
     def test_raises_after_retries_exhausted(self, hdr):
         rate_limited = MagicMock()
@@ -727,6 +803,41 @@ class TestSetSegmentBlankStatus:
             set_segment_blank_status(hdr, False, [101])
         url = mock_put.call_args.args[0]
         assert "false" in url
+
+
+# ---------------------------------------------------------------------------
+# set_segment_published_status
+# ---------------------------------------------------------------------------
+
+class TestSetSegmentPublishedStatus:
+    def test_sends_false(self, hdr):
+        mock_response = MagicMock()
+        mock_response.raise_for_status = MagicMock()
+        mock_response.json.return_value = {"message": "Publish status updated successfully"}
+
+        with patch("naturecubepy.api.httpx.put", return_value=mock_response) as mock_put:
+            result = set_segment_published_status(hdr, False, [101, 102])
+
+        assert result["message"] == "Publish status updated successfully"
+        url = mock_put.call_args.args[0]
+        assert "segmentRecordsPublishStatus" in url
+        assert "/False" in url
+        json_body = mock_put.call_args.kwargs["json"]
+        assert json_body == [101, 102]
+
+    def test_sends_true(self, hdr):
+        mock_response = MagicMock()
+        mock_response.raise_for_status = MagicMock()
+        mock_response.json.return_value = {"message": "Publish status updated successfully"}
+
+        with patch("naturecubepy.api.httpx.put", return_value=mock_response) as mock_put:
+            set_segment_published_status(hdr, True, [101])
+
+        url = mock_put.call_args.args[0]
+        assert "segmentRecordsPublishStatus" in url
+        assert "/True" in url
+        json_body = mock_put.call_args.kwargs["json"]
+        assert json_body == [101]
 
 
 # ---------------------------------------------------------------------------

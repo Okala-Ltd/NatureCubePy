@@ -80,6 +80,37 @@ ProjectStatus = Literal[
 
 
 # ============================================================
+# Observation DataFrame column contracts
+# ============================================================
+
+SPECIES_OBS_CORE_COLUMNS: list[str] = [
+    "project_system_record_id",
+    "device_id",
+    "data_type",
+    "measurement_type",
+    "latitude",
+    "longitude",
+    "label",
+    "label_id",
+    "common_name",
+    "species",
+    "class",
+    "genus",
+    "family",
+    "order",
+]
+
+STATION_LOOKUP_COLUMNS: list[str] = [
+    "project_system_record_id",
+    "device_id",
+    "data_type",
+    "measurement_type",
+    "latitude",
+    "longitude",
+]
+
+
+# ============================================================
 # Authentication Schema
 # ============================================================
 
@@ -161,6 +192,7 @@ class LabelDB(AddLabel):
     label_record_uuid: UUID | str | None = Field(default_factory=lambda: str(uuid4()))
     number_of_individuals: int | None = 1
     prediction_accuracy: float | None = 100
+    segment_record_published: bool | None = None
     label_created_at: datetime | None = Field(default_factory=datetime.now)
 
 
@@ -476,7 +508,8 @@ class ProjectBaseCentroidProperties(BaseModel):
     project_description: str
     project_start_timestamp: datetime
     project_end_timestamp: datetime
-    project_status: ProjectStatus
+    # Older API payloads may omit project_status.
+    project_status: ProjectStatus | None = None
     project_colour: str | None = None
     project_ha: float | None = None
     project_published: bool | None = False

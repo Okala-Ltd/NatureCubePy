@@ -46,8 +46,9 @@ hdr = auth_headers("your_api_key_here")
 get_project(hdr)
 # Setting your active project as - My Ecology Project
 
-# Get station metadata (video, audio, image, or eDNA)
-stations = get_station_info(hdr, datatype="video")
+# Get station metadata by measurement type
+# camera returns both image + video stations
+stations = get_station_info(hdr, measurement_type="camera")
 
 # Plot stations on an interactive map
 map_widget = plot_stations(stations)
@@ -71,8 +72,29 @@ map_widget.save("stations.html")
 | Function | Description |
 |---|---|
 | `get_project(hdr)` | Display the active project name |
-| `get_station_info(hdr, datatype)` | Return a `GeoDataFrame` of station metadata |
+| `get_station_info(hdr, measurement_type)` | Return a `GeoDataFrame` of station metadata; `camera` includes image + video |
+| `get_species_observations(hdr, measurement_types=None)` | Unified species observation retrieval across camera/audio/eDNA |
 | `plot_stations(gdf)` | Return a `folium.Map` of station locations |
+
+### Reporting & Static Figures
+
+| Function | Description |
+|---|---|
+| `plot_stations_static(stations_df, sensor_type="all", project_boundary=None)` | Return a static `matplotlib` map figure (PNG-ready) with optional uploaded project boundary and scale bar |
+| `generate_reports(...)` | Generate report assets (data caches, figures, tables, science text). Delivery DOCX assembly lives in OkalaReporter. |
+
+#### Static station map example (PNG + uploaded boundary)
+
+```python
+from naturecubepy.visualization_tables import plot_stations_static
+
+fig = plot_stations_static(
+    stations_df=stations,
+    sensor_type="camera trap",  # all | camera trap | bioacoustic | edna
+    project_boundary="template/project_boundary.geojson",  # optional
+)
+fig.savefig("camera_sampling_locations.png", dpi=300, bbox_inches="tight")
+```
 
 ### Media Assets
 
