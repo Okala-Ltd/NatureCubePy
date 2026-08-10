@@ -1,30 +1,52 @@
 # NatureCubePy
 
-Python wrapper around the [Okala](https://okala.io) dashboard API services.
+Python client for the [Okala](https://okala.io) / NatureCube API.
 
-NatureCubePy mirrors the functionality of the [`okalaR`](https://github.com/Okala-Ltd/OkalaR)
-R package, providing the same API wrapper capabilities as a Python library that can be
-submitted to [PyPI](https://pypi.org).
+Use it to authenticate, pull biodiversity observations (camera trap, bioacoustic, eDNA), update labels and media, plot results, and export project figures and tables. It is the Python counterpart to [`NatureCubeR`](https://github.com/Okala-Ltd/NatureCubeR).
 
-Package management is handled by [uv](https://docs.astral.sh/uv/).
+Requires **Python 3.12+**. Package management uses [uv](https://docs.astral.sh/uv/).
+
+---
+
+## What you can do
+
+| Area | Examples |
+|------|----------|
+| **Connect** | Authenticate with an API key and inspect the active project |
+| **Retrieve** | Stations, media, segments, and species observations by sensor |
+| **Update** | Labels, timestamps, blank/publish status, eDNA uploads |
+| **Analyze & plot** | Station maps, species summaries, accumulation curves, IUCN charts |
+| **Export** | Cache project data and save standard figures and summary tables |
+
+---
+
+## Package layout
+
+| Module | Role |
+|--------|------|
+| `naturecubepy.api` | HTTP API wrappers (auth, stations, observations, labels, eDNA) |
+| `naturecubepy.viz` | Maps, timelines, species and eDNA plots |
+| `naturecubepy.analysis` | Load project data; summary tables; `export_project_assets` |
+| `naturecubepy.phone_observations` | Build and upload phone-based field observations |
+| `naturecubepy.schema` | Pydantic models shared across the package |
+
+Most day-to-day helpers are also re-exported from `naturecubepy` directly.
 
 ---
 
 ## Installation
 
-### From PyPI (once published)
-
 ```bash
 pip install naturecubepy
-# or with uv:
+# or
 uv add naturecubepy
 ```
 
-### Development installation
+### Development install
 
 ```bash
-git clone https://github.com/Okala-Ltd/OkalaR.git
-cd OkalaR/NatureCubePy
+git clone https://github.com/Okala-Ltd/NatureCubePy.git
+cd NatureCubePy
 uv sync
 ```
 
@@ -33,185 +55,75 @@ uv sync
 ## Quick start
 
 ```python
-import os
-from naturecubepy import auth_headers, get_project, get_station_info, plot_stations
-
-# Set your API key (or export OKALA_API_KEY in your shell)
-os.environ["OKALA_API_KEY"] = "your_api_key_here"
-
-# Authenticate
-hdr = auth_headers("your_api_key_here")
-
-# Check active project
-get_project(hdr)
-# Setting your active project as - My Ecology Project
-
-# Get station metadata by measurement type
-# camera returns both image + video stations
-stations = get_station_info(hdr, measurement_type="camera")
-
-# Plot stations on an interactive map
-map_widget = plot_stations(stations)
-map_widget.save("stations.html")
-```
-
----
-
-## API Reference
-
-### Authentication
-
-| Function | Description |
-|---|---|
-| `get_key()` | Read `OKALA_API_KEY` from environment |
-| `auth_headers(api_key)` | Create auth context for production API |
-| `auth_headers_dev(api_key)` | Create auth context for development API |
-
-### Project & Stations
-
-| Function | Description |
-|---|---|
-| `get_project(hdr)` | Display the active project name |
-| `get_station_info(hdr, measurement_type)` | Return a `GeoDataFrame` of station metadata; `camera` includes image + video |
-| `get_species_observations(hdr, measurement_types=None)` | Unified species observation retrieval across camera/audio/eDNA |
-| `plot_stations(gdf)` | Return a `folium.Map` of station locations |
-
-### Reporting & Static Figures
-
-| Function | Description |
-|---|---|
-| `plot_stations_static(stations_df, sensor_type="all", project_boundary=None)` | Return a static `matplotlib` map figure (PNG-ready) with optional uploaded project boundary and scale bar |
-| `generate_reports(...)` | Generate report assets (data caches, figures, tables, science text). Delivery DOCX assembly lives in OkalaReporter. |
-
-#### Static station map example (PNG + uploaded boundary)
-
-```python
-from naturecubepy.visualization_tables import plot_stations_static
-
-fig = plot_stations_static(
-    stations_df=stations,
-    sensor_type="camera trap",  # all | camera trap | bioacoustic | edna
-    project_boundary="template/project_boundary.geojson",  # optional
-)
-fig.savefig("camera_sampling_locations.png", dpi=300, bbox_inches="tight")
-```
-
-### Media Assets
-
-| Function | Description |
-|---|---|
-| `get_media_assets(hdr, datatype, psr_id)` | Retrieve media for a project system record |
-| `update_media_timestamps(hdr, media_records)` | Update timestamps directly |
-| `push_new_timestamps(hdr, media_metadata, chunksize)` | Update timestamps in chunks |
-
-### Labels
-
-| Function | Description |
-|---|---|
-| `get_project_labels(hdr, labeltype)` | Get project labels (`"Bioacoustic"` or `"Camera"`) |
-| `add_project_labels(hdr, labeltype, labels)` | Add labels to project |
-| `get_iucn_labels(hdr, offset, limit, search_term)` | Search IUCN species database |
-| `add_iucn_labels(hdr, labels, chunksize)` | Add IUCN labels in chunks |
-| `push_new_labels(hdr, submission_records, chunksize)` | Push segment label updates |
-| `set_segment_blank_status(hdr, blank_status, segment_record_ids)` | Mark/unmark segments as blank |
-
-### eDNA
-
-| Function | Description |
-|---|---|
-| `check_edna_labels(hdr, edna_data)` | Validate eDNA records against the database |
-| `upload_edna_records(hdr, validated_data, project_system_record_id)` | Upload validated eDNA |
-
-### Phone Observations
-
-| Function | Description |
-|---|---|
-| `build_device_settings(...)` | Build device metadata for upload |
-| `build_observation(...)` | Build a single GeoJSON observation |
-| `build_feature_record(...)` | Build a feature (collection of observations) |
-| `validate_observation_payload(...)` | Validate payload before upload |
-| `upload_phone_observations(...)` | Upload observations (with optional media) |
-
----
-
-## Phone Observations Example
-
-```python
-from datetime import datetime, timezone
 from naturecubepy import (
     auth_headers,
-    build_device_settings,
-    build_observation,
-    build_feature_record,
-    upload_phone_observations,
+    get_key,
+    get_project,
+    get_station_info,
+    get_camera_trap_data,
 )
+from naturecubepy.viz import station_map, station_explorer
 
-hdr = auth_headers("your_api_key")
+# Authenticate (reads OKALA_API_KEY, or pass the key string directly)
+hdr = auth_headers(get_key())
 
-device = build_device_settings(
-    device_id="device-abc123",
-    phone_model="iPhone 14 Pro",
-    phone_os="iOS 17.2",
-    carrier="Vodafone",
-    build_number="1.2.3",
-    build_id="build-456",
-)
+get_project(hdr)  # prints the active project name
 
-obs = build_observation(
-    item_uuid="f47ac10b-58cc-4372-a567-0e02b2c3d479",
-    item_type="text",
-    data=["Observed 3 red kites circling"],
-    geometry={"type": "Point", "coordinates": [-1.5, 53.4]},
-)
+stations = get_station_info(hdr, measurement_type="all")
+camtrap = get_camera_trap_data(hdr, include_iucn_status=True)
 
-feature = build_feature_record(
-    feature_uuid="feature-uuid-123",
-    project_system_id=42,
-    procedure_id=7,
-    start_time=datetime(2024, 1, 15, 9, 0, tzinfo=timezone.utc),
-    end_time=datetime(2024, 1, 15, 10, 0, tzinfo=timezone.utc),
-    created_by_method="drawn",
-    geometry={"type": "Point", "coordinates": [-1.5, 53.4]},
-    observations=[obs],
-)
+# Interactive map
+station_explorer(stations)
 
-result = upload_phone_observations(
-    hdr=hdr,
-    project_id=42,
-    feature_payload=[feature],
-    device_settings=device,
-)
-print(result["summary"])
+# Static satellite map
+fig = station_map(stations, measurement_type="all")
+fig.savefig("stations.png", dpi=300, bbox_inches="tight")
 ```
+
+For local API development, pass a custom root:
+
+```python
+hdr = auth_headers(get_key(), "http://127.0.0.1:8000/api/")
+```
+
+---
+
+## Next steps
+
+Step-by-step notebooks live in [`tutorials/`](tutorials/README.md):
+
+1. [Authentication](tutorials/01_authentication.ipynb)
+2. [Data retrieval](tutorials/02_data_retrieval.ipynb)
+3. [Data upload](tutorials/03_data_upload.ipynb)
+4. [Visualization](tutorials/04_visualization.ipynb)
+
+Common follow-ons:
+
+```python
+# All sensors in one call, or export figures/tables for a project
+from naturecubepy import get_species_observations, load_project_data, export_project_assets
+
+observations = get_species_observations(hdr)          # camera + audio + eDNA
+bundle = load_project_data(hdr)                       # ObservationBundle for analysis/plots
+assets = export_project_assets(hdr, output_dir="project_output")
+```
+
+Plotting helpers are in `naturecubepy.viz` (`station_map`, `records_per_class`, `plot_top_species`, `plot_edna_records`, `iucn_bar_plot`, and more) — see the visualization tutorial for examples of each.
 
 ---
 
 ## Development
 
-### Running tests
-
 ```bash
-uv run pytest
-```
-
-### Building the package
-
-```bash
-uv build
-```
-
-### Publishing to PyPI
-
-```bash
-uv publish
+uv run pytest   # tests
+uv build        # build wheel/sdist
+uv publish      # publish to PyPI
 ```
 
 ---
 
-## License
+## License & support
 
-Apache License 2.0 — see [LICENSE](../LICENSE) for details.
+Apache License 2.0.
 
-## Support
-
-For issues and questions, please open a GitHub issue or contact [adam@okala.io](mailto:adam@okala.io).
+Questions or bugs: open a GitHub issue or email [adam@okala.io](mailto:adam@okala.io).

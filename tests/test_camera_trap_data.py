@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import geopandas as gpd
+import httpx
 import pandas as pd
 import pytest
 
@@ -110,25 +111,27 @@ def test_get_camera_trap_data_raises_when_station_ids_missing(hdr):
             get_camera_trap_data(hdr)
 
 
-def test_get_camera_trap_data_accepts_list_segment_payload(hdr):
-    stations = _station_frame(101, "image", 12.1, -0.1)
+def test_get_camera_trap_data_keeps_partial_results_when_one_station_fails(hdr):
+    image_stations = _station_frame(101, "image", 12.1, -0.1)
+    video_stations = _station_frame(202, "video", 12.2, -0.2)
+    all_camera_stations = pd.concat([image_stations, video_stations], ignore_index=True)
 
     def fake_get_station_info(_hdr, measurement_type):
-        assert measurement_type == "camera"
-        return stations
+        return all_camera_stations
 
     def fake_get_media_assets_df(_hdr, datatype, project_system_record_ids=None):
         psr_ids = project_system_record_ids or []
-        return pd.DataFrame([_media_record(int(psr_ids[0]), 1).model_dump(mode="json")])
+        psr_id = int(psr_ids[0])
+        if psr_id == 202:
+            raise httpx.HTTPStatusError(
+                "429",
+                request=MagicMock(),
+                response=MagicMock(status_code=429, headers={}),
+            )
+        return pd.DataFrame([_media_record(psr_id, 1).model_dump(mode="json")])
 
     def fake_get_media_segments(_hdr, datatype, project_system_record_ids=None):
-        return [
-            {
-                "segment_record_id": 1,
-                "segment_note": "note-image",
-                "manager_verified": True,
-            }
-        ]
+        return [{"segment_record_id": 1, "segment_note": "note-image"}]
 
     with (
         patch("naturecubepy.api.get_station_info", side_effect=fake_get_station_info),
@@ -137,5 +140,5 @@ def test_get_camera_trap_data_accepts_list_segment_payload(hdr):
     ):
         result = get_camera_trap_data(hdr)
 
-    assert not result.empty
-    assert result["segment_note"].iloc[0] == "note-image"
+    assert len(result) == 1
+    assert result["data_type"].iloc[0] == "image"

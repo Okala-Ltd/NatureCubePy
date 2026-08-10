@@ -181,6 +181,91 @@ def get_project(hdr: AuthHeaders, timeout: float = 180.0) -> GetProjectGeometryR
     return GetProjectGeometryResponse.model_validate(data)
 
 
+def _strip_null_altitude(coords: Any) -> Any:
+    """Drop null Z values that pydantic-geojson injects into coordinates."""
+    if (
+        isinstance(coords, list)
+        and coords
+        and all(isinstance(value, (int, float, type(None))) for value in coords)
+    ):
+        return [value for value in coords if value is not None]
+    if isinstance(coords, list):
+        return [_strip_null_altitude(value) for value in coords]
+    return coords
+
+
+def _feature_for_geopandas(feature: dict[str, Any]) -> dict[str, Any]:
+    """Normalise a GeoJSON feature dict for ``GeoDataFrame.from_features``."""
+    geometry = feature.get("geometry")
+    if isinstance(geometry, dict) and "coordinates" in geometry:
+        geometry = {
+            **geometry,
+            "coordinates": _strip_null_altitude(geometry["coordinates"]),
+        }
+        geometry.pop("bbox", None)
+    return {**feature, "geometry": geometry}
+
+
+def project_boundary_gdf(project: GetProjectGeometryResponse) -> gpd.GeoDataFrame:
+    """Convert a :func:`get_project` response into a boundary GeoDataFrame (EPSG:4326).
+
+    Parameters
+    ----------
+    project:
+        Response from :func:`get_project`.
+
+    Returns
+    -------
+    geopandas.GeoDataFrame
+        Project boundary features with CRS set to EPSG:4326. Empty when the
+        response has no boundary features.
+    """
+    features = [
+        _feature_for_geopandas(feature.model_dump(mode="json"))
+        for feature in project.boundary.features
+    ]
+    if not features:
+        return gpd.GeoDataFrame(geometry=[], crs="EPSG:4326")
+    return gpd.GeoDataFrame.from_features(features, crs="EPSG:4326")
+
+
+def get_project_boundary(
+    hdr: AuthHeaders,
+    timeout: float = 180.0,
+    *,
+    project: GetProjectGeometryResponse | None = None,
+) -> gpd.GeoDataFrame:
+    """Fetch the active project boundary as a GeoDataFrame.
+
+    Uses the ``boundary`` FeatureCollection from ``GET /api/getProject/{api_key}``.
+    Pass an existing ``project`` from :func:`get_project` to avoid a second request.
+
+    Parameters
+    ----------
+    hdr:
+        Authentication context returned by :func:`auth_headers`.
+    timeout:
+        Request timeout in seconds (ignored when ``project`` is provided).
+    project:
+        Optional cached :class:`GetProjectGeometryResponse` from :func:`get_project`.
+
+    Returns
+    -------
+    geopandas.GeoDataFrame
+        Project boundary polygon(s) in EPSG:4326, suitable for
+        ``plot_stations_static(..., project_boundary=...)``.
+
+    Examples
+    --------
+    >>> boundary = get_project_boundary(hdr)  # doctest: +SKIP
+    >>> project = get_project(hdr)  # doctest: +SKIP
+    >>> boundary = get_project_boundary(hdr, project=project)  # doctest: +SKIP
+    """
+    if project is None:
+        project = get_project(hdr, timeout=timeout)
+    return project_boundary_gdf(project)
+
+
 def fetch_station_features(hdr: AuthHeaders, datatype: str) -> gpd.GeoDataFrame:
     """Fetch all station rows for a datatype as a GeoDataFrame, with pagination."""
     url = f"{hdr.root}getStations/{datatype}/{hdr.key}"
@@ -279,6 +364,45 @@ def get_stations_typed(hdr: AuthHeaders, datatype: DataTypes) -> StationResponse
 # Media assets & segments
 # ---------------------------------------------------------------------------
 
+MEDIA_PAGE_TIMEOUT = 180.0
+MEDIA_MAX_RETRIES = 6
+MEDIA_RETRY_BASE_SECONDS = 2.0
+
+
+def _retry_after_seconds(response: httpx.Response, attempt: int) -> float:
+    """Compute wait time for a rate-limited or transient failure."""
+    header = response.headers.get("Retry-After")
+    if header:
+        try:
+            return max(float(header), MEDIA_RETRY_BASE_SECONDS)
+        except ValueError:
+            pass
+    return MEDIA_RETRY_BASE_SECONDS * (2 ** attempt)
+
+
+def _post_media_page(
+    url: str,
+    *,
+    psr_ids: list[int],
+    limit: int,
+    offset: int,
+    timeout: float = MEDIA_PAGE_TIMEOUT,
+) -> httpx.Response:
+    """POST a media page with retries for HTTP 429 rate limits."""
+    params = {"limit": min(limit, 1000), "offset": offset}
+
+    for attempt in range(MEDIA_MAX_RETRIES + 1):
+        response = httpx.post(url, json=psr_ids, params=params, timeout=timeout)
+        if response.status_code == 429 and attempt < MEDIA_MAX_RETRIES:
+            time.sleep(_retry_after_seconds(response, attempt))
+            continue
+        response.raise_for_status()
+        return response
+
+    # Unreachable: final attempt either returns or raise_for_status()'s.
+    raise RuntimeError("media page request failed after retries")
+
+
 # ---------------------------------------------------------------------------
 # Page fetchers
 # ---------------------------------------------------------------------------
@@ -291,13 +415,12 @@ def fetch_media_assets_page(
     limit: int = 1000,
     offset: int = 0,
 ) -> tuple[list[MediaRecordAPIFlat], int | None]:
-    response = httpx.post(
+    response = _post_media_page(
         f"{hdr.root}getMediaAssets/{datatype}/{hdr.key}",
-        json=psr_ids,
-        params={"limit": min(limit, 3000), "offset": offset},
-        timeout=30.0,
+        psr_ids=psr_ids,
+        limit=limit,
+        offset=offset,
     )
-    response.raise_for_status()
     payload = response.json()
     return [MediaRecordAPIFlat.model_validate(row) for row in extract_rows_from_payload(payload)], extract_total_count(payload)
 
@@ -310,13 +433,12 @@ def fetch_media_segments_page(
     limit: int = 1000,
     offset: int = 0,
 ) -> tuple[list[SegmentRecordAPIFlat], int | None]:
-    response = httpx.post(
+    response = _post_media_page(
         f"{hdr.root}getMediaSegments/{datatype}/{hdr.key}",
-        json=psr_ids,
-        params={"limit": min(limit, 3000), "offset": offset},
-        timeout=30.0,
+        psr_ids=psr_ids,
+        limit=limit,
+        offset=offset,
     )
-    response.raise_for_status()
     payload = response.json()
     return [SegmentRecordAPIFlat.model_validate(row) for row in extract_rows_from_payload(payload)], extract_total_count(payload)
 
@@ -345,13 +467,27 @@ def _iter_pages(
                 rows, page_total = fetch_page(hdr, datatype, chunk, limit=page_size, offset=offset)
             except httpx.TimeoutException:
                 if len(chunk) <= 1:
-                    raise
-                mid = max(1, len(chunk) // 2)
-                yield from _iter_pages(fetch_page, hdr, datatype, chunk[:mid],
-                                       page_size=page_size, chunk_size=chunk_size)
-                yield from _iter_pages(fetch_page, hdr, datatype, chunk[mid:],
-                                       page_size=page_size, chunk_size=chunk_size)
-                break
+                    # Single-station timeouts: brief retry before failing hard.
+                    retried = False
+                    for attempt in range(2):
+                        time.sleep(MEDIA_RETRY_BASE_SECONDS * (2 ** attempt))
+                        try:
+                            rows, page_total = fetch_page(
+                                hdr, datatype, chunk, limit=page_size, offset=offset
+                            )
+                            retried = True
+                            break
+                        except httpx.TimeoutException:
+                            continue
+                    if not retried:
+                        raise
+                else:
+                    mid = max(1, len(chunk) // 2)
+                    yield from _iter_pages(fetch_page, hdr, datatype, chunk[:mid],
+                                           page_size=page_size, chunk_size=chunk_size)
+                    yield from _iter_pages(fetch_page, hdr, datatype, chunk[mid:],
+                                           page_size=page_size, chunk_size=chunk_size)
+                    break
 
             if page_total is not None:
                 total = page_total
@@ -378,7 +514,7 @@ def iter_media_assets(
     psr_ids: int | list[int],
     *,
     page_size: int = 1000,
-    chunk_size: int = 10,
+    chunk_size: int = 1,
 ) -> Iterator[MediaRecordAPIFlat]:
     yield from _iter_pages(
         fetch_media_assets_page, hdr, datatype, normalise_psr_ids(psr_ids),
@@ -392,7 +528,7 @@ def iter_media_segments(
     psr_ids: int | list[int],
     *,
     page_size: int = 1000,
-    chunk_size: int = 10,
+    chunk_size: int = 1,
 ) -> Iterator[SegmentRecordAPIFlat]:
     yield from _iter_pages(
         fetch_media_segments_page, hdr, datatype, normalise_psr_ids(psr_ids),
@@ -403,17 +539,51 @@ def iter_media_segments(
 # Convenience collectors
 # ---------------------------------------------------------------------------
 
-def get_media_assets(hdr: AuthHeaders, datatype: DataTypes, psr_ids: int | list[int]) -> list[MediaRecordAPIFlat]:
-    return list(iter_media_assets(hdr, datatype, psr_ids))
+def get_media_assets(
+    hdr: AuthHeaders,
+    datatype: DataTypes,
+    psr_ids: int | list[int],
+    *,
+    page_size: int = 1000,
+    chunk_size: int = 1,
+) -> list[MediaRecordAPIFlat]:
+    return list(iter_media_assets(hdr, datatype, psr_ids, page_size=page_size, chunk_size=chunk_size))
 
-def get_media_segments(hdr: AuthHeaders, datatype: DataTypes, psr_ids: int | list[int]) -> list[SegmentRecordAPIFlat]:
-    return list(iter_media_segments(hdr, datatype, psr_ids))
+def get_media_segments(
+    hdr: AuthHeaders,
+    datatype: DataTypes,
+    psr_ids: int | list[int],
+    *,
+    page_size: int = 1000,
+    chunk_size: int = 1,
+) -> list[SegmentRecordAPIFlat]:
+    return list(iter_media_segments(hdr, datatype, psr_ids, page_size=page_size, chunk_size=chunk_size))
 
-def get_media_assets_df(hdr: AuthHeaders, datatype: DataTypes, psr_ids: int | list[int]) -> pd.DataFrame:
-    return pd.DataFrame(row.model_dump() for row in iter_media_assets(hdr, datatype, psr_ids))
+def get_media_assets_df(
+    hdr: AuthHeaders,
+    datatype: DataTypes,
+    psr_ids: int | list[int],
+    *,
+    page_size: int = 1000,
+    chunk_size: int = 1,
+) -> pd.DataFrame:
+    return pd.DataFrame(
+        row.model_dump()
+        for row in iter_media_assets(hdr, datatype, psr_ids, page_size=page_size, chunk_size=chunk_size)
+    )
 
-def get_media_segments_df(hdr: AuthHeaders, datatype: DataTypes, psr_ids: int | list[int]) -> pd.DataFrame:
-    return pd.DataFrame(row.model_dump() for row in iter_media_segments(hdr, datatype, psr_ids))
+def get_media_segments_df(
+    hdr: AuthHeaders,
+    datatype: DataTypes,
+    psr_ids: int | list[int],
+    *,
+    page_size: int = 1000,
+    chunk_size: int = 1,
+) -> pd.DataFrame:
+    return pd.DataFrame(
+        row.model_dump()
+        for row in iter_media_segments(hdr, datatype, psr_ids, page_size=page_size, chunk_size=chunk_size)
+    )
 
 # ---------------------------------------------------------------------------
 # Observation data helpers
@@ -622,6 +792,8 @@ def get_camera_trap_data(
     """Retrieve merged camera trap media rows for all image and video stations.
 
     Both image and video camera trap data are always returned together.
+    Stations are fetched one at a time so a rate-limit or timeout on a single
+    large deployment does not discard data already retrieved for other stations.
 
     Parameters
     ----------
@@ -645,6 +817,7 @@ def get_camera_trap_data(
     """
     stations = get_station_info(hdr, "camera")
     frames: list[pd.DataFrame] = []
+    errors: list[str] = []
 
     for datatype in ["image", "video"]:
         scoped_stations = stations
@@ -656,20 +829,36 @@ def get_camera_trap_data(
         if station_lookup.empty:
             continue
 
-        psr_ids = station_lookup["project_system_record_id"].tolist()
-        media_df = get_media_assets_df(hdr, datatype, psr_ids)
-        if media_df.empty:
-            continue
-        segments_df = get_media_segments(hdr, datatype, psr_ids)
-        media_df = resolve_psr_id_column(media_df)
-        merged = merge_segments(media_df, segments_df)
-        merged = merge_station_lookup(merged, station_lookup)
-        if "data_type" not in merged.columns:
-            merged["data_type"] = datatype
-        if not merged.empty:
-            frames.append(merged)
+        for psr_id in station_lookup["project_system_record_id"].tolist():
+            try:
+                media_df = get_media_assets_df(hdr, datatype, [psr_id])
+                if media_df.empty:
+                    continue
+                segments_df = get_media_segments(hdr, datatype, [psr_id])
+                media_df = resolve_psr_id_column(media_df)
+                merged = merge_segments(media_df, segments_df)
+                merged = merge_station_lookup(merged, station_lookup)
+                if "data_type" not in merged.columns:
+                    merged["data_type"] = datatype
+                if not merged.empty:
+                    frames.append(merged)
+            except Exception as exc:
+                errors.append(f"PSR {psr_id} ({datatype}): {exc}")
+            # Brief pause between stations to reduce API rate-limit pressure.
+            time.sleep(0.5)
+
+    if errors:
+        print(
+            f"Warning: camera trap download had {len(errors)} station failure(s). "
+            f"First error: {errors[0]}"
+        )
 
     if not frames:
+        if errors:
+            raise RuntimeError(
+                "Camera trap download failed for all stations. "
+                f"First error: {errors[0]}"
+            )
         return pd.DataFrame(columns=STATION_LOOKUP_COLUMNS)
 
     result = pd.concat(frames, ignore_index=True, sort=False)

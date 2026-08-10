@@ -29,6 +29,8 @@ from naturecubepy.api import (
     get_media_assets_df,
     get_media_segments,
     get_project,
+    get_project_boundary,
+    project_boundary_gdf,
     get_species_observations,
     get_project_labels,
     get_station_info,
@@ -70,11 +72,13 @@ from naturecubepy.phone_observations import (
     upload_phone_observations,
     validate_observation_payload,
 )
-from naturecubepy.analysis import ObservationBundle, load_project_data, save_observation_bundle
-from naturecubepy.report_builder import (
-    ReportBuildResult,
-    build_core_report_text,
-    generate_reports,
+from naturecubepy.analysis import (
+    ObservationBundle,
+    ProjectAssetExport,
+    export_project_assets,
+    load_project_data,
+    save_all_tables,
+    save_observation_bundle,
 )
 
 
@@ -83,15 +87,14 @@ __all__ = [
     "get_key",
     "auth_headers",
     "get_project",
+    "get_project_boundary",
+    "project_boundary_gdf",
     "get_species_observations",
     "get_station_info",
     "get_stations_typed",
-    "plot_stations",
     "get_media_assets",
     "get_media_assets_df",
     "get_camera_trap_data",
-    "get_camera_trap_data_for_species",
-    "get_audio_data",
     "get_audio_observation_data",
     "get_media_segments",
     "get_project_labels",
@@ -107,6 +110,7 @@ __all__ = [
     "check_edna_labels",
     "check_edna_labels_df",
     "upload_edna_records",
+    "get_edna_observation_data",
     # schema types
     "AuthHeaders",
     "SPECIES_OBS_CORE_COLUMNS",
@@ -133,11 +137,11 @@ __all__ = [
     "build_feature_record",
     "validate_observation_payload",
     "upload_phone_observations",
-    # analysis / report assets
+    # analysis / asset export
     "ObservationBundle",
+    "ProjectAssetExport",
     "load_project_data",
     "save_observation_bundle",
-    "ReportBuildResult",
-    "build_core_report_text",
-    "generate_reports",
+    "save_all_tables",
+    "export_project_assets",
 ]

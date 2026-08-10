@@ -135,6 +135,80 @@ class TestGetProject:
         assert result.boundary.features[0].properties.project_status is None
 
 
+class TestGetProjectBoundary:
+    _boundary_payload = {
+        "boundary": {
+            "type": "FeatureCollection",
+            "features": [
+                {
+                    "type": "Feature",
+                    "geometry": {
+                        "type": "Polygon",
+                        "coordinates": [[[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 0.0]]],
+                    },
+                    "properties": {
+                        "project_name": "My Project",
+                        "project_description": "desc",
+                        "project_start_timestamp": "2024-01-01T00:00:00Z",
+                        "project_end_timestamp": "2024-12-31T00:00:00Z",
+                    },
+                }
+            ],
+        },
+        "rois": {"type": "FeatureCollection", "features": []},
+        "locations": {"type": "FeatureCollection", "features": []},
+    }
+
+    def test_returns_geodataframe_from_api(self, hdr):
+        from naturecubepy.api import get_project_boundary
+
+        mock_response = MagicMock()
+        mock_response.raise_for_status = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = self._boundary_payload
+
+        with patch("naturecubepy.api.httpx.get", return_value=mock_response):
+            result = get_project_boundary(hdr)
+
+        assert isinstance(result, gpd.GeoDataFrame)
+        assert len(result) == 1
+        assert result.crs is not None
+        assert result.crs.to_epsg() == 4326
+        assert result.geometry.iloc[0] is not None
+
+    def test_reuses_cached_project(self, hdr):
+        from naturecubepy.api import get_project, get_project_boundary
+
+        mock_response = MagicMock()
+        mock_response.raise_for_status = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = self._boundary_payload
+
+        with patch("naturecubepy.api.httpx.get", return_value=mock_response) as mock_get:
+            project = get_project(hdr)
+            result = get_project_boundary(hdr, project=project)
+
+        assert mock_get.call_count == 1
+        assert isinstance(result, gpd.GeoDataFrame)
+        assert len(result) == 1
+
+    def test_empty_boundary(self, hdr):
+        from naturecubepy.api import project_boundary_gdf
+        from naturecubepy.schema import GetProjectGeometryResponse
+
+        project = GetProjectGeometryResponse.model_validate(
+            {
+                "boundary": {"type": "FeatureCollection", "features": []},
+                "rois": {"type": "FeatureCollection", "features": []},
+                "locations": {"type": "FeatureCollection", "features": []},
+            }
+        )
+        result = project_boundary_gdf(project)
+        assert isinstance(result, gpd.GeoDataFrame)
+        assert result.empty
+        assert result.crs.to_epsg() == 4326
+
+
 # ---------------------------------------------------------------------------
 # get_station_info
 # ---------------------------------------------------------------------------
@@ -346,7 +420,9 @@ class TestMediaPagination:
                 side_effect=validated,
             ),
         ):
-            result = get_media_segments(hdr, "video", psr_ids=[1, 2])
+            result = get_media_segments(
+                hdr, "video", psr_ids=[1, 2], page_size=1000, chunk_size=10
+            )
 
         assert isinstance(result, list)
         assert len(result) == 1100
@@ -365,7 +441,9 @@ class TestMediaPagination:
                 side_effect=validated,
             ),
         ):
-            result = get_media_segments(hdr, "video", psr_ids=[1, 2])
+            result = get_media_segments(
+                hdr, "video", psr_ids=[1, 2], page_size=1000, chunk_size=10
+            )
 
         assert isinstance(result, list)
         assert len(result) == 1100
@@ -387,7 +465,9 @@ class TestMediaPagination:
                 side_effect=validated,
             ),
         ):
-            result = get_media_assets_df(hdr, "video", psr_ids=[1, 2])
+            result = get_media_assets_df(
+                hdr, "video", psr_ids=[1, 2], page_size=1000, chunk_size=10
+            )
 
         assert isinstance(result, pd.DataFrame)
         assert len(result) == 1100
@@ -409,7 +489,9 @@ class TestMediaPagination:
                 side_effect=validated,
             ),
         ):
-            result = get_media_assets_df(hdr, "video", psr_ids=[1, 2])
+            result = get_media_assets_df(
+                hdr, "video", psr_ids=[1, 2], page_size=1000, chunk_size=10
+            )
 
         assert isinstance(result, pd.DataFrame)
         assert len(result) == 1100
@@ -443,16 +525,55 @@ class TestMediaPagination:
                 "naturecubepy.api.MediaRecordAPIFlat.model_validate",
                 side_effect=validated,
             ),
+            patch("naturecubepy.api.time.sleep"),
         ):
             result = get_media_assets_df(
                 hdr,
                 "audio",
                 psr_ids=[101, 202],
+                page_size=1000,
+                chunk_size=10,
             )
 
         assert isinstance(result, pd.DataFrame)
         assert len(result) == 2
         assert set(result["project_system_record_id_fk"]) == {101, 202}
+
+    def test_retries_on_http_429(self, hdr):
+        validated = [MagicMock(model_dump=lambda: {"id": 1})]
+        calls = {"n": 0}
+
+        def fake_post(_url, json=None, params=None, timeout=None):
+            calls["n"] += 1
+            response = MagicMock()
+            if calls["n"] == 1:
+                response.status_code = 429
+                response.headers = {"Retry-After": "0"}
+                response.raise_for_status.side_effect = httpx.HTTPStatusError(
+                    "429",
+                    request=MagicMock(),
+                    response=response,
+                )
+                return response
+            response.status_code = 200
+            response.headers = {}
+            response.raise_for_status = MagicMock()
+            response.json.return_value = [{"id": 1}]
+            return response
+
+        with (
+            patch("naturecubepy.api.httpx.post", side_effect=fake_post),
+            patch(
+                "naturecubepy.api.MediaRecordAPIFlat.model_validate",
+                side_effect=validated,
+            ),
+            patch("naturecubepy.api.time.sleep") as mock_sleep,
+        ):
+            result = get_media_assets_df(hdr, "video", psr_ids=[1], page_size=1000)
+
+        assert len(result) == 1
+        assert calls["n"] == 2
+        mock_sleep.assert_called()
 
 
 class TestSegmentRecordValidation:
