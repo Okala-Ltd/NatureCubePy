@@ -18,7 +18,6 @@ from io import BytesIO
 import folium
 from matplotlib import pyplot as plt
 from matplotlib.lines import Line2D
-import matplotlib.cm as cm
 from matplotlib.colors import TABLEAU_COLORS
 import matplotlib.dates as mdates
 from matplotlib.gridspec import GridSpec
@@ -34,26 +33,56 @@ from shapely import wkt as shapely_wkt
 # ---------------------------------------------------------------------------
 
 SENSOR_COLORS = {
-    "Camera": "#1f77b4",
-    "Bioacoustic": "#ff7f0e",
-    "eDNA": "#2ca02c",
+    "Camera": "#AEF8C1",
+    "Bioacoustic": "#F8F5E4",
+    "eDNA": "#67ECB5",
 }
 
+# Core Okala palette.
+CORE_PALETTE = [
+    "#093939",
+    "#AEF7C0",
+    "#F8F5E4",
+    "#45546A",
+    "#67ECB5",
+]
+
+# Biodiversity plots palette.
+BIODIVERSITY_PALETTE = [
+    "#DDA0DD",
+    "#304E4F",
+    "#F5F5DC",
+    "#76EEC6",
+]
+
+# Sampled from the Okala lockup; used for station markers so they carry the
+# brand mint and stay legible over satellite imagery.
+LOGO_MINT = "#AEF8C1"
+
+# Map legend panel: Okala dark teal ground with cream type and mint accents.
+PANEL_BG = "#093939"
+PANEL_TEXT = "#F8F5E4"
+PANEL_ACCENT = "#67ECB5"
+PANEL_MUTED = "#A9C6BE"
+
 CLASS_COLORS = {
-    "Mammalia": "#3E5859",
-    "Aves": "#D9ACDE",
-    "Reptilia": "#F6F6E2",
-    "Insecta": "#9DEECF",
+    "Mammalia": "#304E4F",
+    "Aves": "#DDA0DD",
+    "Reptilia": "#F5F5DC",
+    "Insecta": "#76EEC6",
 }
 
 IUCN_COLOR_MAP = {
-        "Critically Endangered": "#7f0000",
-        "Endangered": "#d7301f",
-        "Vulnerable": "#fc8d59",
-        "Near Threatened": "#fdcc8a",
-        "Least Concern": "#c7e9b4",
-        "Data Deficient": "#9ecae1",
-        "Not Evaluated": "#d9d9d9",
+        "Extinct": "#000000",
+        "Extinct in the Wild": "#542344",
+        "Critically Endangered": "#D81E05",
+        "Endangered": "#FC7F3F",
+        "Vulnerable": "#F9E814",
+        "Near Threatened": "#CCE226",
+        "Least Concern": "#60C659",
+        "Data Deficient": "#D1D1C6",
+        "Not Evaluated": "#FFFFFF",
+        "Not Applicable": "#C1B5A5",
 }
 
 
@@ -208,6 +237,26 @@ def make_size_breaks(
     )
 
 
+def _nice_tick_step(max_value: float, n_ticks_target: int = 6) -> int:
+    """Return a 1-2-5*10^k tick step close to max_value / n_ticks_target."""
+    if max_value <= 0:
+        return 1
+    raw = max_value / max(1, n_ticks_target)
+    exponent = int(math.floor(math.log10(raw)))
+    base = 10 ** exponent
+    scaled = raw / base
+    if scaled <= 1:
+        nice = 1
+    elif scaled <= 2:
+        nice = 2
+    elif scaled <= 5:
+        nice = 5
+    else:
+        nice = 10
+    # int() truncates for sub-1 bases (e.g. max_value=1 → step 0.2), so clamp.
+    return max(1, int(round(nice * base)))
+
+
 def _style_class_axis(
         ax,
         *,
@@ -217,27 +266,9 @@ def _style_class_axis(
         font_family: str = "Arial",
         y_tick_step: int = 0,
         x_label_rotation: float = 45.0,
+        y_baseline_pad: float = 0.03,
 ) -> None:
     """Apply axis formatting to a class bar chart axis."""
-    def _nice_tick_step(max_value: float, n_ticks_target: int = 6) -> int:
-        """Return a 1-2-5*10^k y-axis step close to max_value / n_ticks_target."""
-        if max_value <= 0:
-            return 1
-        raw = max_value / max(1, n_ticks_target)
-        exponent = int(math.floor(math.log10(raw)))
-        base = 10 ** exponent
-        scaled = raw / base
-        if scaled <= 1:
-            nice = 1
-        elif scaled <= 2:
-            nice = 2
-        elif scaled <= 5:
-            nice = 5
-        else:
-            nice = 10
-        # int() truncates for sub-1 bases (e.g. max_value=1 → step 0.2), so clamp.
-        return max(1, int(round(nice * base)))
-
     max_val = float(np.nanmax(values)) if len(values) > 0 else 0.0
     if not np.isfinite(max_val):
         max_val = 0.0
@@ -245,7 +276,9 @@ def _style_class_axis(
     if step <= 0:
         step = 1
     y_max = int(np.ceil(max_val / step) * step) if max_val > 0 else step
-    y_lower_pad = max(0.8, step * 0.04)
+    # Pad as a fraction of the axis range so y=0 lands at the same height in
+    # every panel, whatever each panel's data scale is.
+    y_lower_pad = y_max * y_baseline_pad
     ax.set_ylim(-y_lower_pad, y_max)
     ax.set_yticks(np.arange(0, y_max + 1, step))
     ax.spines["left"].set_bounds(0, y_max)
@@ -556,7 +589,7 @@ def _format_lat(lat: float) -> str:
     return f"{abs(lat):.2f}°{hemi}"
 
 
-def _add_lonlat_ticks(ax, *, font_family: str = "DejaVu Sans") -> None:
+def _add_lonlat_ticks(ax, *, font_family: str = "DejaVu Sans", color: str = "#111111") -> None:
     """Draw lon/lat tick labels around a Web Mercator map frame."""
     x0, x1 = ax.get_xlim()
     y0, y1 = ax.get_ylim()
@@ -586,8 +619,8 @@ def _add_lonlat_ticks(ax, *, font_family: str = "DejaVu Sans") -> None:
         lat_ticks.append(lat)
         lat += lat_step
 
-    tick_kw = dict(color="#111111", linewidth=0.8, clip_on=False, zorder=6)
-    label_kw = dict(fontsize=7, color="#111111", fontfamily=font_family, clip_on=False)
+    tick_kw = dict(color=color, linewidth=0.8, clip_on=False, zorder=6)
+    label_kw = dict(fontsize=7, color=color, fontfamily=font_family, clip_on=False)
 
     # Bottom / top longitude ticks
     for lon in lon_ticks:
@@ -612,102 +645,162 @@ def _add_lonlat_ticks(ax, *, font_family: str = "DejaVu Sans") -> None:
         ax.text(x1 + dx * 1.8, y, _format_lat(lat), ha="left", va="center", **label_kw)
 
 
-def _add_north_arrow(ax) -> None:
-    """Simple black/white north arrow in the map frame (top-left)."""
-    x0, x1 = ax.get_xlim()
-    y0, y1 = ax.get_ylim()
-    w = x1 - x0
-    h = y1 - y0
-    cx = x0 + w * 0.08
-    cy = y1 - h * 0.12
-    arrow_h = h * 0.07
-    arrow_w = w * 0.018
+def _axes_frac_per_inch(ax) -> tuple[float, float]:
+    """Axes-fraction units per inch for an axes spanning 0-1 in both directions."""
+    fig_w, fig_h = ax.figure.get_size_inches()
+    pos = ax.get_position()
+    width_in = max(pos.width * fig_w, 1e-6)
+    height_in = max(pos.height * fig_h, 1e-6)
+    return 1.0 / width_in, 1.0 / height_in
 
-    north = Polygon(
-        [(cx, cy + arrow_h * 0.55), (cx - arrow_w, cy), (cx, cy + arrow_h * 0.15)],
-        closed=True,
-        facecolor="#111111",
-        edgecolor="#111111",
-        linewidth=0.6,
-        zorder=7,
-        clip_on=False,
-    )
-    south = Polygon(
-        [(cx, cy + arrow_h * 0.55), (cx + arrow_w, cy), (cx, cy + arrow_h * 0.15)],
-        closed=True,
-        facecolor="#ffffff",
-        edgecolor="#111111",
-        linewidth=0.6,
-        zorder=7,
-        clip_on=False,
-    )
-    ax.add_patch(north)
-    ax.add_patch(south)
+
+def _nice_scalebar_length(target_m: float) -> float:
+    """Largest 1/2/5 x 10^k value that still fits the available bar width."""
+    if target_m <= 0:
+        return 100.0
+    exponent = math.floor(math.log10(target_m))
+    for mantissa in (5.0, 2.0, 1.0):
+        candidate = mantissa * 10.0**exponent
+        if candidate <= target_m:
+            return candidate
+    return 10.0**exponent
+
+
+def _draw_north_arrow(
+    ax,
+    *,
+    x: float,
+    y: float,
+    height_in: float = 0.34,
+    color: str = "#111111",
+    background: str = "#ffffff",
+) -> float:
+    """Two-tone north arrow drawn in axes-fraction coordinates.
+
+    ``x``/``y`` are the arrow centre and base; returns the y position just
+    below the arrow so callers can stack further items underneath.
+    """
+    fx, fy = _axes_frac_per_inch(ax)
+    arrow_h = height_in * fy
+    arrow_w = height_in * 0.42 * fx
+
+    tip = y + arrow_h
+    waist = y + arrow_h * 0.28
+    common = dict(closed=True, edgecolor=color, linewidth=0.6, zorder=4, clip_on=False)
+    ax.add_patch(Polygon([(x, tip), (x - arrow_w, y), (x, waist)], facecolor=color, **common))
+    ax.add_patch(Polygon([(x, tip), (x + arrow_w, y), (x, waist)], facecolor=background, **common))
     ax.text(
-        cx,
-        cy + arrow_h * 0.72,
+        x,
+        tip + 0.02 * fy,
         "N",
         ha="center",
         va="bottom",
         fontsize=9,
         fontweight="bold",
-        color="#111111",
-        zorder=7,
+        color=color,
+        zorder=4,
         clip_on=False,
     )
+    return y
 
 
-def _add_cartography_scalebar(ax, length_m: float | None = None) -> None:
-    """Segmented black/white scale bar in the map frame (bottom-left)."""
-    x0, x1 = ax.get_xlim()
-    y0, y1 = ax.get_ylim()
-    width = x1 - x0
-    height = y1 - y0
-    if width <= 0 or height <= 0:
-        return
+def _draw_scalebar(
+    ax,
+    map_ax,
+    *,
+    x: float,
+    y: float,
+    max_width: float = 0.78,
+    color: str = "#111111",
+    background: str = "#ffffff",
+) -> tuple[float, float]:
+    """Segmented scale bar drawn in axes-fraction coordinates of a sidebar axes.
 
-    if length_m is None:
-        target = width * 0.22
-        choices = np.array([100, 200, 500, 1000, 2000, 5000, 10000, 20000, 50000, 100000], dtype=float)
-        length_m = float(choices[np.argmin(np.abs(choices - target))])
+    The bar length is derived from the Web Mercator extent of ``map_ax``,
+    corrected to ground distance at the centre latitude of the map. Returns the
+    drawn bar's ``(width, height)`` in axes fractions so callers can align other
+    elements to it.
+    """
+    x0, x1 = map_ax.get_xlim()
+    y0, y1 = map_ax.get_ylim()
+    data_w = x1 - x0
+    data_h = y1 - y0
+    if data_w <= 0 or data_h <= 0:
+        return 0.0, 0.0
 
-    start_x = x0 + width * 0.06
-    start_y = y0 + height * 0.06
-    bar_h = height * 0.012
+    fig_w, fig_h = map_ax.figure.get_size_inches()
+    map_pos = map_ax.get_position()
+    # With aspect="equal" the drawn map is letterboxed inside its subplot box,
+    # so the tighter of the two dimensions sets the projected metres per inch.
+    merc_per_in = max(
+        data_w / max(map_pos.width * fig_w, 1e-6),
+        data_h / max(map_pos.height * fig_h, 1e-6),
+    )
+
+    _, lat_centre = Transformer.from_crs(3857, 4326, always_xy=True).transform(
+        (x0 + x1) / 2, (y0 + y1) / 2
+    )
+    ground_per_in = merc_per_in * math.cos(math.radians(lat_centre))
+    if not np.isfinite(ground_per_in) or ground_per_in <= 0:
+        return 0.0, 0.0
+
+    fx, fy = _axes_frac_per_inch(ax)
+    bar_in = _nice_scalebar_length(ground_per_in * (max_width / fx)) / ground_per_in
+    bar_w = bar_in * fx
+    length_m = bar_in * ground_per_in
+    bar_h = 0.075 * fy
+
     n_segs = 4
-    seg_w = length_m / n_segs
-
+    seg_w = bar_w / n_segs
     for i in range(n_segs):
-        color = "#111111" if i % 2 == 0 else "#ffffff"
         ax.add_patch(
             Rectangle(
-                (start_x + i * seg_w, start_y),
+                (x + i * seg_w, y),
                 seg_w,
                 bar_h,
-                facecolor=color,
-                edgecolor="#111111",
+                facecolor=color if i % 2 == 0 else background,
+                edgecolor=color,
                 linewidth=0.7,
-                zorder=7,
+                zorder=4,
                 clip_on=False,
             )
         )
 
-    label_y = start_y + bar_h * 2.2
-    for i, frac in enumerate([0.0, 0.5, 1.0]):
-        x = start_x + length_m * frac
-        val = length_m * frac
-        if val >= 1000:
-            label = f"{val / 1000:.0f}" if frac > 0 else "0"
-            unit = " km"
-        else:
-            label = f"{int(val)}" if frac > 0 else "0"
-            unit = " m"
-        text = label + (unit if frac == 1.0 else "")
-        ax.text(x, label_y, text, ha="center", va="bottom", fontsize=7, color="#111111", zorder=7, clip_on=False)
+    unit_km = length_m >= 1000
+    for frac in (0.0, 0.5, 1.0):
+        value = length_m * frac / 1000 if unit_km else length_m * frac
+        label = f"{value:g}"
+        if frac == 1.0:
+            label += " km" if unit_km else " m"
+        ax.text(
+            x + bar_w * frac,
+            y + bar_h * 1.5,
+            label,
+            ha="center",
+            va="bottom",
+            fontsize=7,
+            color=color,
+            zorder=4,
+            clip_on=False,
+        )
+    return bar_w, bar_h
+
+
+def _default_logo_path() -> Path | None:
+    """Locate the bundled Okala lockup, falling back to a repo-level assets folder."""
+    candidates = [Path(__file__).parent / "assets" / "okala_logo.png"]
+    for parent in Path(__file__).resolve().parents[:4]:
+        candidates.extend(sorted((parent / "assets").glob("*okala*ogo*.png")))
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return None
 
 
 def _load_okala_logo(logo_path: str | Path | None) -> np.ndarray | None:
     """Load Okala lockup as RGBA (dark logo for light/white sidebars)."""
+    if logo_path is None:
+        logo_path = _default_logo_path()
     if logo_path is None:
         return None
     path = Path(logo_path)
@@ -730,60 +823,136 @@ def _draw_station_map_sidebar(
     has_boundary: bool,
     logo_rgba: np.ndarray | None,
     title: str = "Legend",
+    map_ax=None,
+    panel_top: float = 1.0,
+    panel_bottom: float = 0.0,
 ) -> None:
-    """English legend sidebar with Okala branding (dark logo on white)."""
+    """Legend panel on the Okala dark ground, aligned to the map frame.
+
+    ``panel_top``/``panel_bottom`` are the map frame edges in this axes'
+    fraction coordinates; the panel grows downwards if its content needs more
+    room than the map frame height.
+    """
     ax.set_xlim(0, 1)
     ax.set_ylim(0, 1)
     ax.axis("off")
-    ax.set_facecolor("#ffffff")
+    fx, fy = _axes_frac_per_inch(ax)
 
-    y = 0.96
-    ax.text(0.06, y, title, fontsize=14, fontweight="bold", color="#111111", va="top", fontfamily="DejaVu Sans")
-    y -= 0.07
+    pad = 0.20 * fy
+    left = 0.08
+    row_h = 0.24 * fy
+    logo_w = 0.72
 
-    # Boundary
-    if has_boundary:
-        ax.plot([0.06, 0.16], [y, y], color="#4b5563", linewidth=2.2, solid_capstyle="butt")
-        ax.text(0.20, y, "Project boundary", fontsize=9, color="#111111", va="center")
-        y -= 0.055
+    logo_h = 0.0
+    if logo_rgba is not None:
+        img_h, img_w = logo_rgba.shape[:2]
+        logo_h = (logo_w / fx) * (img_h / img_w) * fy
 
-    # Sensor types present
-    for sensor in types_present:
-        color = color_map.get(sensor, SENSOR_COLORS.get(sensor, "#999999"))
-        ax.scatter([0.11], [y], s=55, c=[color], edgecolors="#1f2933", linewidths=0.8, zorder=2)
-        ax.text(0.20, y, str(sensor), fontsize=9, color="#111111", va="center")
-        y -= 0.05
-
-    # Record-count size cue
-    y -= 0.02
-    ax.text(0.06, y, "Record count", fontsize=9, fontweight="bold", color="#111111", va="top")
-    y -= 0.045
-    for size, label in [(18, "Low"), (36, "Medium"), (58, "High")]:
-        ax.scatter([0.11], [y], s=size, c=["#9ca3af"], edgecolors="#1f2933", linewidths=0.6)
-        ax.text(0.20, y, label, fontsize=8, color="#374151", va="center")
-        y -= 0.04
-
-    # Metadata
     meta_lines = [
         "Coordinate system: EPSG:3857",
         "Basemap: Esri World Imagery",
         "Data: Okala / NatureCube",
         f"Date: {date.today().strftime('%b %Y')}",
     ]
-    meta_y = 0.22
-    for line in meta_lines:
-        ax.text(0.06, meta_y, line, fontsize=7, color="#4b5563", va="top")
-        meta_y -= 0.028
+    meta_h = len(meta_lines) * 0.19 * fy
 
-    # Logo — brand guideline: black/dark lockup on light backgrounds
+    scale_h = 0.075 * fy * 1.5 + 0.14 * fy + 0.50 * fy
+    entries_h = (
+        0.34 * fy
+        + (row_h if has_boundary else 0.0)
+        + row_h * len(types_present)
+        + 0.30 * fy
+        + row_h * 3
+    )
+    needed = pad + logo_h + 0.28 * fy + entries_h + 0.34 * fy + scale_h + 0.40 * fy + meta_h + pad
+
+    top = min(1.0, max(panel_top, needed))
+    bottom = max(0.0, min(panel_bottom, top - needed))
+    ax.add_patch(
+        Rectangle(
+            (0.0, bottom),
+            1.0,
+            top - bottom,
+            facecolor=PANEL_BG,
+            edgecolor="none",
+            zorder=0,
+            clip_on=False,
+        )
+    )
+
+    def rule(y: float) -> None:
+        ax.plot([left, 1 - left], [y, y], color=PANEL_TEXT, alpha=0.25, linewidth=0.8, zorder=1)
+
+    y = top - pad
+
+    # Mint lockup sits at the head of the panel, on the dark ground.
     if logo_rgba is not None:
         ax.imshow(
             logo_rgba,
-            extent=(0.06, 0.94, 0.03, 0.12),
+            extent=((1 - logo_w) / 2, (1 + logo_w) / 2, y - logo_h, y),
             aspect="auto",
-            zorder=3,
+            zorder=2,
             interpolation="bilinear",
         )
+        y -= logo_h + 0.14 * fy
+        rule(y)
+        y -= 0.14 * fy
+
+    ax.text(left, y, title, fontsize=13, fontweight="bold", color=PANEL_TEXT, va="top", fontfamily="DejaVu Sans")
+    y -= 0.44 * fy
+
+    chip_w = 0.23 * fx
+    label_x = left + chip_w + 0.05
+
+    if has_boundary:
+        ax.plot([left, left + chip_w], [y, y], color=PANEL_TEXT, linewidth=2.4, solid_capstyle="butt", zorder=3)
+        ax.text(label_x, y, "Project boundary", fontsize=9, color=PANEL_TEXT, va="center")
+        y -= row_h
+
+    for sensor in types_present:
+        color = color_map.get(sensor, LOGO_MINT)
+        ax.scatter([left + chip_w / 2], [y], s=62, c=[color], edgecolors="#1f2933", linewidths=0.8, zorder=3)
+        ax.text(label_x, y, str(sensor), fontsize=9, color=PANEL_TEXT, va="center")
+        y -= row_h
+
+    y -= 0.30 * fy
+    ax.text(left, y, "Record count", fontsize=9, fontweight="bold", color=PANEL_ACCENT, va="center")
+    y -= row_h
+    for size, label in [(20, "Low"), (55, "Medium"), (110, "High")]:
+        ax.scatter([left + chip_w / 2], [y], s=size, c=[LOGO_MINT], edgecolors="#1f2933", linewidths=0.7, zorder=3)
+        ax.text(label_x, y, label, fontsize=8, color=PANEL_TEXT, va="center")
+        y -= row_h
+
+    # Scale bar first, so the north arrow can be centred on the drawn bar. The
+    # pair is centred in whatever space is left above the source metadata.
+    meta_rule_y = bottom + pad + meta_h + 0.12 * fy
+    if map_ax is not None:
+        slack = (y - 0.20 * fy - meta_rule_y) - scale_h
+        bar_y = meta_rule_y + max(slack / 2, 0.10 * fy)
+        bar_w, bar_h = _draw_scalebar(
+            ax,
+            map_ax,
+            x=left,
+            y=bar_y,
+            max_width=1 - 2 * left,
+            color=PANEL_TEXT,
+            background=PANEL_BG,
+        )
+        if bar_w > 0:
+            _draw_north_arrow(
+                ax,
+                x=left + bar_w / 2,
+                y=bar_y + bar_h * 1.5 + 0.14 * fy,
+                color=PANEL_TEXT,
+                background=PANEL_BG,
+            )
+
+    # Metadata pinned to the foot of the panel
+    meta_y = bottom + pad
+    rule(meta_rule_y)
+    for line in reversed(meta_lines):
+        ax.text(left, meta_y, line, fontsize=7, color=PANEL_MUTED, va="bottom")
+        meta_y += 0.19 * fy
 
 
 def station_map(
@@ -793,21 +962,35 @@ def station_map(
     project_boundary: str | Path | gpd.GeoDataFrame | None = None,
     output_path: str | Path | None = None,
     logo_path: str | Path | None = None,
-    title: str | None = None,
 ):
     """Cartography-style sampling map for reports.
 
-    Layout matches Okala map products: satellite map with lon/lat edge ticks,
-    north arrow, segmented scale bar, and a white English legend sidebar with
-    the Okala logo (dark lockup on light background).
+    Layout matches Okala map products: satellite map with lon/lat edge ticks
+    and a legend panel on the Okala dark ground carrying the mint lockup,
+    sensor keys, north arrow, segmented scale bar, and source metadata.
+
+    ``logo_path`` defaults to the Okala lockup bundled with the package; pass a
+    path to override it.
     """
+    def _no_stations_figure():
+        fig, ax = plt.subplots(figsize=(10, 7), facecolor=PANEL_BG)
+        ax.set_facecolor(PANEL_BG)
+        ax.text(
+            0.5,
+            0.5,
+            "No sampling locations available for selected sensor",
+            ha="center",
+            va="center",
+            color=PANEL_TEXT,
+            transform=ax.transAxes,
+        )
+        ax.axis("off")
+        return fig
+
     try:
         gdf = load_stations(stations)
     except ValueError:
-        fig, ax = plt.subplots(figsize=(10, 7))
-        ax.text(0.5, 0.5, "No sampling locations available for selected sensor", ha="center", va="center", transform=ax.transAxes)
-        ax.axis("off")
-        return fig
+        return _no_stations_figure()
 
     if measurement_type != "all":
         if "measurement_type" not in gdf.columns:
@@ -815,10 +998,7 @@ def station_map(
         gdf = gdf[gdf["measurement_type"] == measurement_type].copy()
 
     if gdf.empty:
-        fig, ax = plt.subplots(figsize=(10, 7))
-        ax.text(0.5, 0.5, "No sampling locations available for selected sensor", ha="center", va="center", transform=ax.transAxes)
-        ax.axis("off")
-        return fig
+        return _no_stations_figure()
 
     if not isinstance(gdf, gpd.GeoDataFrame):
         gdf = gpd.GeoDataFrame(
@@ -838,7 +1018,12 @@ def station_map(
     gdf_plot["plot_size"] = gdf_plot["record_count"].apply(scale_size)
 
     types = sorted(gdf_plot["measurement_type"].fillna("Unknown").unique().tolist()) if "measurement_type" in gdf_plot.columns else ["Station"]
-    color_map = {t: SENSOR_COLORS.get(t, list(TABLEAU_COLORS.values())[i % len(TABLEAU_COLORS)]) for i, t in enumerate(types)}
+    # Use the light Okala brand tints so sensor types remain distinct while
+    # retaining enough contrast over satellite imagery.
+    color_map = {
+        t: SENSOR_COLORS.get(_canonical_measurement_type(t), LOGO_MINT)
+        for t in types
+    }
 
     boundary_gdf = load_project_boundary(project_boundary, target_crs=gdf_plot.crs)
     if boundary_gdf is not None:
@@ -846,8 +1031,10 @@ def station_map(
         if boundary_gdf.empty:
             boundary_gdf = None
 
-    fig = plt.figure(figsize=(11.5, 8.0), facecolor="#ffffff")
-    gs = GridSpec(1, 2, width_ratios=[3.05, 1.0], wspace=0.04, left=0.06, right=0.98, top=0.94, bottom=0.08)
+    fig = plt.figure(figsize=(11.5, 8.0), facecolor=PANEL_BG)
+    # wspace leaves room for the map's right-hand latitude labels, which are
+    # drawn outside the map frame and would otherwise run into the legend.
+    gs = GridSpec(1, 2, width_ratios=[3.05, 1.0], wspace=0.12, left=0.06, right=0.98, top=0.94, bottom=0.08)
     ax = fig.add_subplot(gs[0, 0])
     ax_leg = fig.add_subplot(gs[0, 1])
 
@@ -871,7 +1058,10 @@ def station_map(
         warnings.warn("Could not load satellite basemap; plotting without tiles.", stacklevel=2)
 
     if boundary_gdf is not None:
-        boundary_gdf.boundary.plot(ax=ax, color="#4b5563", linewidth=1.8, zorder=3)
+        # Dark halo under a thick white line so the boundary reads over both
+        # bright and dark satellite imagery.
+        boundary_gdf.boundary.plot(ax=ax, color="#111111", linewidth=5.0, alpha=0.45, zorder=3)
+        boundary_gdf.boundary.plot(ax=ax, color="#ffffff", linewidth=2.8, zorder=4)
 
     group_col = gdf_plot["measurement_type"].fillna("Unknown") if "measurement_type" in gdf_plot.columns else pd.Series(["Station"] * len(gdf_plot), index=gdf_plot.index)
     for sensor, group in gdf_plot.groupby(group_col):
@@ -883,25 +1073,30 @@ def station_map(
             edgecolors="#1f2933",
             linewidths=0.8,
             alpha=0.9,
-            zorder=4,
+            zorder=5,
             label=str(sensor),
         )
 
-    _add_north_arrow(ax)
-    _add_cartography_scalebar(ax)
-    _add_lonlat_ticks(ax)
+    # Ticks and frame carry the panel's cream, since the labels sit outside the
+    # frame on the dark ground.
+    _add_lonlat_ticks(ax, color=PANEL_TEXT)
 
     ax.set_aspect("equal")
+    ax.set_facecolor(PANEL_BG)
     for side in ["top", "right", "left", "bottom"]:
         ax.spines[side].set_visible(True)
-        ax.spines[side].set_color("#111111")
+        ax.spines[side].set_color(PANEL_TEXT)
         ax.spines[side].set_linewidth(1.0)
     ax.tick_params(left=False, bottom=False, labelleft=False, labelbottom=False)
     ax.set_xticks([])
     ax.set_yticks([])
 
-    if title:
-        ax.set_title(title, fontsize=11, fontweight="bold", color="#111111", pad=10)
+    # Equal aspect shrinks the map axes to fit its data, so the frame's real
+    # position is only known after a draw. Resolve it before laying out the
+    # panel so the panel edges line up with the map frame.
+    fig.canvas.draw()
+    map_pos = ax.get_position()
+    leg_pos = ax_leg.get_position()
 
     logo_rgba = _load_okala_logo(logo_path)
     _draw_station_map_sidebar(
@@ -911,10 +1106,13 @@ def station_map(
         has_boundary=boundary_gdf is not None,
         logo_rgba=logo_rgba,
         title="Legend",
+        map_ax=ax,
+        panel_top=(map_pos.y1 - leg_pos.y0) / leg_pos.height,
+        panel_bottom=(map_pos.y0 - leg_pos.y0) / leg_pos.height,
     )
 
     if output_path is not None:
-        fig.savefig(output_path, dpi=300, bbox_inches="tight", pad_inches=0.15, facecolor="#ffffff")
+        fig.savefig(output_path, dpi=300, bbox_inches="tight", pad_inches=0.15, facecolor=fig.get_facecolor())
 
     return fig
 
@@ -1010,10 +1208,11 @@ def camera_activity_timeline(
     id_col: str | None = None,
     start_cols: list[str] | None = None,
     end_cols: list[str] | None = None,
-    figsize=(10, 5),
+    figsize=(8.5, 5),
     save_path: str | Path | None = None,
     font_family="Arial",
-    linewidth=4,
+    marker_size=36,
+    day_lines=True,
     font_size=12
 ):
     """
@@ -1032,6 +1231,12 @@ def camera_activity_timeline(
 
     end_cols:
         Candidate end timestamp columns.
+
+    marker_size:
+        Marker area for the start/end points.
+
+    day_lines:
+        Draw a faint vertical line on every day covered by a deployment.
 
     Returns
     -------
@@ -1190,7 +1395,7 @@ def camera_activity_timeline(
 
     centers = {}
     cursor = 0
-    gap = 3
+    gap = 0
 
 
     for year in years:
@@ -1207,9 +1412,16 @@ def camera_activity_timeline(
         cursor = values.max() + gap + 1
 
 
-    fig_height = max(
-        8,
-        len(timeline) * 0.03,
+    # Height follows the number of stacked rows so bars stay a sensible
+    # thickness once they are drawn edge to edge.
+    total_slots = max(int(cursor), 1)
+
+    fig_height = float(
+        np.clip(
+            total_slots * 0.18 + 1.5,
+            3.0,
+            22.0,
+        )
     )
 
     fig, ax = plt.subplots(
@@ -1218,13 +1430,28 @@ def camera_activity_timeline(
     )
 
 
-    colors = cm.Set3(
-        np.linspace(0, 1, len(years))
-    )
+    # Light palette colours carry the year bands and dark ones the bars, so
+    # every fill is an exact hex with no transparency.
+    band_cycle = [
+        CORE_PALETTE[2],  # cream
+        CORE_PALETTE[1],  # pale mint
+        CORE_PALETTE[4],  # mint
+    ]
 
-    year_colors = dict(
-        zip(years, colors)
-    )
+    bar_cycle = [
+        CORE_PALETTE[0],  # deep teal
+        CORE_PALETTE[3],  # slate
+    ]
+
+    band_colors = {
+        year: band_cycle[i % len(band_cycle)]
+        for i, year in enumerate(years)
+    }
+
+    bar_colors = {
+        year: bar_cycle[i % len(bar_cycle)]
+        for i, year in enumerate(years)
+    }
 
 
     for year in years:
@@ -1236,39 +1463,76 @@ def camera_activity_timeline(
         ax.axhspan(
             y[idx].min() - 0.5,
             y[idx].max() + 0.5,
-            color=year_colors[year],
-            alpha=0.25,
+            color=band_colors[year],
+            zorder=0,
         )
+
+
+    if day_lines:
+
+        tracked_days = sorted({
+            day
+            for start, end in zip(
+                timeline["start_plot"],
+                timeline["end_plot"],
+            )
+            for day in pd.date_range(start, end, freq="D")
+        })
+
+        # White reads as a light line against all three band colours.
+        for day in tracked_days:
+            ax.axvline(
+                day,
+                color="white",
+                linewidth=0.35,
+                zorder=1,
+            )
+
+
+    starts = mdates.date2num(timeline["start_plot"])
+    ends = mdates.date2num(timeline["end_plot"])
+
+    # date2num is in days, so a same-day deployment still gets a visible bar.
+    widths = np.maximum(ends - starts, 1.0)
 
 
     for year in years:
 
-        mask = timeline["year"] == year
+        mask = (timeline["year"] == year).to_numpy()
 
-        ax.hlines(
-            y=y[mask],
-            xmin=timeline.loc[mask, "start_plot"],
-            xmax=timeline.loc[mask, "end_plot"],
-            color=year_colors[year],
-            linewidth=4,
+        ax.barh(
+            y[mask],
+            widths[mask],
+            left=starts[mask],
+            height=0.8,
+            color=bar_colors[year],
+            edgecolor="white",
+            linewidth=1.0,
+            zorder=2,
         )
 
 
+    # Contrasting hues with a dark outline so both stay readable wherever they
+    # land, on a dark bar or on a light year band.
     ax.scatter(
         timeline["start_plot"],
         y,
-        s=22,
-        color="#1f4e79",
-        edgecolor="white",
+        s=marker_size,
+        color="#76EEC6",
+        edgecolor="#093939",
+        linewidth=1.0,
+        zorder=3,
         label="Start",
     )
 
     ax.scatter(
         timeline["end_plot"],
         y,
-        s=22,
-        color="#c0392b",
-        edgecolor="white",
+        s=marker_size,
+        color="#DDA0DD",
+        edgecolor="#093939",
+        linewidth=1.0,
+        zorder=3,
         label="End",
     )
 
@@ -1276,22 +1540,45 @@ def camera_activity_timeline(
     for year in years:
 
         ax.text(
-            pd.Timestamp("2000-01-10"),
+            -0.01,
             centers[year],
             str(year),
+            transform=ax.get_yaxis_transform(),
+            rotation=90,
+            ha="right",
+            va="center",
             fontsize=11,
             fontweight="bold",
+            fontfamily=font_family,
+            zorder=4,
         )
 
 
+    # Pad the year so a marker sitting on 1 Jan or 31 Dec is not clipped in
+    # half by the edge of the axes.
+    axis_pad = pd.Timedelta(days=5)
+
     ax.set_xlim(
-        pd.Timestamp("2000-01-01"),
-        pd.Timestamp("2000-12-31"),
+        pd.Timestamp("2000-01-01") - axis_pad,
+        pd.Timestamp("2000-12-31") + axis_pad,
     )
 
+    # Match the year bands exactly so no white strip shows above the x axis.
+    if len(y):
+        ax.set_ylim(
+            y.min() - 0.5,
+            y.max() + 0.5,
+        )
 
-    ax.xaxis.set_major_locator(
-        mdates.MonthLocator()
+
+    # Fixed ticks rather than a locator, so the padded limits do not add a
+    # thirteenth month at either end.
+    ax.set_xticks(
+        pd.date_range(
+            "2000-01-01",
+            "2000-12-01",
+            freq="MS",
+        )
     )
 
     ax.xaxis.set_major_formatter(
@@ -1315,10 +1602,12 @@ def camera_activity_timeline(
     ax.grid(
         axis="x",
         linestyle="--",
-        alpha=0.5,
+        color=CORE_PALETTE[3],
+        linewidth=0.7,
     )
 
     ax.grid(False, axis="y")
+    ax.set_axisbelow(True)
 
 
     for side in [
@@ -1329,10 +1618,20 @@ def camera_activity_timeline(
         ax.spines[side].set_visible(False)
 
 
-    ax.legend(
-        frameon=False,
+    # Anchored just outside the top right corner so it can never sit on top of
+    # a deployment that runs late in the year.
+    legend = ax.legend(
         fontsize=font_size,
+        loc="lower right",
+        bbox_to_anchor=(1.0, 1.01),
+        ncol=2,
+        frameon=True,
+        facecolor="white",
+        edgecolor=CORE_PALETTE[3],
+        framealpha=1.0,
     )
+
+    legend.set_zorder(5)
 
 
     plt.tight_layout()
@@ -1398,6 +1697,7 @@ def records_per_class(
     font_family: str = "Arial",
     figsize: tuple[float, float] = (10.0, 3.8),
     x_label_rotation: float = 45.0,
+    dpi: float = 200.0,
 ):
     """
     Plot records and/or species counts per taxonomic class.
@@ -1408,6 +1708,9 @@ def records_per_class(
         "both"    : records + species panels
         "records" : only number of records
         "species" : only number of species
+    dpi:
+        Figure resolution. Above the matplotlib default so labels stay sharp
+        when the figure is shown inline or saved as a raster.
     """
 
     if panel not in {"both", "records", "species"}:
@@ -1433,6 +1736,7 @@ def records_per_class(
     if metrics.empty:
         fig, ax = plt.subplots(
             figsize=figsize,
+            dpi=dpi,
             facecolor="white",
         )
 
@@ -1477,6 +1781,7 @@ def records_per_class(
     fig, axes = plt.subplots(
         ncols=len(selected),
         figsize=figsize,
+        dpi=dpi,
         squeeze=False,
         facecolor="white",
     )
@@ -1586,6 +1891,8 @@ def plot_top_species(
     top_n: int = 10,
     figsize=(7, 6),
     x_label_rotation: float = 0,
+    font_family: str = "Arial",
+    panel_letters: bool = True,
 ):
     """
     Plot top species for supplied classes.
@@ -1600,6 +1907,8 @@ def plot_top_species(
             "Mammalia": "blue",
             "Aves": "green",
         }
+    panel_letters:
+        Label each class panel with a bold letter (A, B, C, ...).
     """
 
     panels = []
@@ -1646,36 +1955,74 @@ def plot_top_species(
     axes = axes.flatten()
 
 
-    for ax, (class_name, data, color) in zip(
-        axes,
-        panels,
+    for index, (ax, (class_name, data, color)) in enumerate(
+        zip(
+            axes,
+            panels,
+        )
     ):
 
+        positions = np.arange(len(data))
+
         ax.barh(
-            data["species"],
+            positions,
             data["records"],
             color=color,
             edgecolor="#333333",
             linewidth=0.6,
         )
 
-        ax.set(
-            xlabel="Number of records",
-            ylabel=f"{class_name} species",
+        # One tick per bar, so every species is named.
+        ax.set_yticks(positions)
+        ax.set_yticklabels(data["species"])
+        ax.set_ylim(-0.7, len(positions) - 0.3)
+
+        max_records = float(data["records"].max())
+        step = _nice_tick_step(max_records)
+        x_max = int(np.ceil(max_records / step) * step) if max_records > 0 else step
+
+        ax.set_xlim(0, x_max)
+        ax.set_xticks(np.arange(0, x_max + 1, step))
+        ax.spines["bottom"].set_bounds(0, x_max)
+
+        ax.set_xlabel(
+            "Number of records",
+            fontfamily=font_family,
+            fontsize=12,
+        )
+
+        ax.set_ylabel(
+            class_name,
+            fontfamily=font_family,
+            fontsize=14,
+            fontweight="bold",
+            labelpad=10,
         )
 
         ax.tick_params(
             axis="y",
-            labelsize=9,
+            length=0,
+            labelsize=12,
         )
 
         ax.tick_params(
             axis="x",
-            labelsize=9,
+            rotation=x_label_rotation,
+            labelsize=11,
         )
 
-        ax.spines["top"].set_visible(False)
-        ax.spines["right"].set_visible(False)
+        for label in ax.get_xticklabels():
+            label.set_fontfamily(font_family)
+
+        # Scientific names are conventionally italicised.
+        for label in ax.get_yticklabels():
+            label.set_fontfamily(font_family)
+            label.set_fontstyle("italic")
+
+        for side in ["top", "right", "left"]:
+            ax.spines[side].set_visible(False)
+
+        ax.set_axisbelow(True)
 
         ax.grid(
             axis="x",
@@ -1683,14 +2030,20 @@ def plot_top_species(
             alpha=0.4,
         )
 
-        _style_class_axis(
-            ax,
-            values=data["records"].to_numpy(dtype=float),
-            y_label=f"{class_name} species",
-            panel_letter=None,
-            font_family="Arial",
-            x_label_rotation=x_label_rotation,
-        )
+        if panel_letters:
+            # Above the panel, taking its x from the class name (y-axis label)
+            # so the letter lines up with it however wide the species names are.
+            ax.annotate(
+                chr(ord("A") + index),
+                xy=(0.5, 1.02),
+                xycoords=(ax.yaxis.label, "axes fraction"),
+                ha="center",
+                va="bottom",
+                fontsize=16,
+                fontweight="bold",
+                fontfamily=font_family,
+                annotation_clip=False,
+            )
 
 
     plt.tight_layout()
@@ -1909,7 +2262,7 @@ def iucn_bar_plot(
 # Accumulation / eDNA stacks / report figure export
 # ---------------------------------------------------------------------------
 
-PLOT_COLORS = ["#3E5859", "#D9ACDE", "#F6F6E2", "#9DEECF"]
+PLOT_COLORS = list(CLASS_COLORS.values())
 
 def _timestamp_column(df: pd.DataFrame) -> str | None:
     for col in [
@@ -1942,76 +2295,6 @@ def _filter_by_class(df: pd.DataFrame, class_name: str) -> pd.DataFrame:
     mask = class_series.apply(lambda value: any(token in value for token in tokens))
     return df[mask].copy()
 
-def _smooth_accumulation_curve(curve: pd.DataFrame) -> pd.DataFrame:
-    if curve.empty or len(curve) < 5:
-        return curve
-
-    out = curve.copy()
-    window = max(7, int(len(out) * 0.05))
-    if window % 2 == 0:
-        window += 1
-    x = out["x"].to_numpy(dtype=float)
-    x_log = np.log1p(x)
-
-    def _rolling_smooth(values: np.ndarray, smooth_window: int) -> np.ndarray:
-        return (
-            pd.Series(values)
-            .rolling(window=smooth_window, center=True, min_periods=1)
-            .mean()
-            .rolling(window=smooth_window, center=True, min_periods=1)
-            .mean()
-            .to_numpy(dtype=float)
-        )
-
-    for col in ["mean", "lower", "upper"]:
-        y = out[col].to_numpy(dtype=float)
-        y_roll = _rolling_smooth(y, window)
-
-        # Blend rolling smooth with low-degree polynomial trend on log effort for a visually smooth curve.
-        deg = 3 if len(y) >= 8 else 2
-        try:
-            coeff = np.polyfit(x_log, y_roll, deg=deg)
-            y_trend = np.polyval(coeff, x_log)
-            y_smooth = 0.6 * y_roll + 0.4 * y_trend
-        except Exception:
-            y_smooth = y_roll
-
-        out[col] = y_smooth
-
-    out["mean"] = np.maximum.accumulate(out["mean"].to_numpy(dtype=float))
-    out["lower"] = np.maximum.accumulate(out["lower"].to_numpy(dtype=float))
-    out["upper"] = np.maximum.accumulate(out["upper"].to_numpy(dtype=float))
-    out["lower"] = np.minimum(out["lower"], out["mean"])
-    out["upper"] = np.maximum(out["upper"], out["mean"])
-
-    # Densify on the x-axis for smoother rendering of lines and confidence ribbons.
-    if len(out) >= 3:
-        x_dense = np.linspace(float(out["x"].min()), float(out["x"].max()), num=min(1200, max(240, len(out) * 10)))
-        mean_dense = np.interp(x_dense, out["x"].to_numpy(dtype=float), out["mean"].to_numpy(dtype=float))
-        lower_dense = np.interp(x_dense, out["x"].to_numpy(dtype=float), out["lower"].to_numpy(dtype=float))
-        upper_dense = np.interp(x_dense, out["x"].to_numpy(dtype=float), out["upper"].to_numpy(dtype=float))
-
-        dense_window = max(9, int(len(x_dense) * 0.04))
-        if dense_window % 2 == 0:
-            dense_window += 1
-        mean_dense = _rolling_smooth(mean_dense, dense_window)
-        lower_dense = _rolling_smooth(lower_dense, dense_window)
-        upper_dense = _rolling_smooth(upper_dense, dense_window)
-
-        dense = pd.DataFrame(
-            {
-                "x": x_dense,
-                "mean": np.maximum.accumulate(mean_dense),
-                "lower": np.maximum.accumulate(lower_dense),
-                "upper": np.maximum.accumulate(upper_dense),
-            }
-        )
-        dense["lower"] = np.minimum(dense["lower"], dense["mean"])
-        dense["upper"] = np.maximum(dense["upper"], dense["mean"])
-        return dense
-
-    return out
-
 def _plot_species_accumulation_for_groups(
     observations_df: pd.DataFrame,
     stations_df: pd.DataFrame,
@@ -2027,12 +2310,10 @@ def _plot_species_accumulation_for_groups(
         class_df = _filter_by_class(observations_df, class_name)
         if class_df.empty:
             continue
-        curve = _smooth_accumulation_curve(
-            _incidence_species_accumulation_curve(
-                class_df,
-                shared_stations,
-                clip_stations_to_observations=False,
-            )
+        curve = _incidence_species_accumulation_curve(
+            class_df,
+            shared_stations,
+            clip_stations_to_observations=False,
         )
         if curve.empty:
             continue
@@ -2054,13 +2335,20 @@ def _plot_species_accumulation_for_groups(
 
     for ax, (label, curve, display_name) in zip(axes_list, panels):
         color = PLOT_COLORS[0] if display_name == "Mammal" else PLOT_COLORS[1]
-        x_vals = np.r_[0.0, curve["x"].to_numpy(dtype=float)]
-        mean_vals = np.r_[0.0, curve["mean"].to_numpy(dtype=float)]
-        lower_vals = np.r_[0.0, curve["lower"].to_numpy(dtype=float)]
-        upper_vals = np.r_[0.0, curve["upper"].to_numpy(dtype=float)]
+        x_vals = curve["x"].to_numpy(dtype=float)
+        mean_vals = curve["mean"].to_numpy(dtype=float)
 
+        ax.fill_between(
+            x_vals,
+            curve["lower"].to_numpy(dtype=float),
+            curve["upper"].to_numpy(dtype=float),
+            color=color,
+            alpha=0.18,
+            linewidth=0,
+        )
         ax.plot(x_vals, mean_vals, color=color, linewidth=2)
-        ax.fill_between(x_vals, lower_vals, upper_vals, color=color, alpha=0.15)
+        # Reference point: richness observed at the full sampling effort.
+        ax.plot(x_vals[-1], mean_vals[-1], marker="o", markersize=5, color=color, zorder=3)
         if show_letters:
             ax.text(-0.10, 1.04, label, transform=ax.transAxes, ha="left", va="bottom", fontsize=14, fontweight="bold", clip_on=False)
         ax.set_xlabel(effort_label)
@@ -2068,14 +2356,8 @@ def _plot_species_accumulation_for_groups(
         ax.set_title(display_name)
         ax.set_xlim(0.0, max(1.0, shared_x_max))
 
-        lower_min = float(curve["lower"].min()) if not curve.empty else 0.0
         upper = float(curve["upper"].max()) if not curve.empty else 0.0
-        if upper <= 0:
-            ax.set_ylim(0, 1)
-        else:
-            y_pad = (upper - lower_min) * 0.05 if upper > lower_min else max(0.25, upper * 0.05)
-            y_min = max(0.0, lower_min - y_pad)
-            ax.set_ylim(y_min, upper * 1.05)
+        ax.set_ylim(0, upper * 1.05 if upper > 0 else 1)
         _apply_minimal_axes_style(ax, grid_axis="both")
 
     plt.tight_layout()
@@ -2264,10 +2546,10 @@ def plot_edna_records(
 
     rank_order_use = rank_order if rank_order is not None else ["Order", "Family", "Genus", "Species"]
     colors_use = color_map if color_map is not None else {
-        "Order": "#3E5859",
-        "Family": "#F6F6E2",
-        "Genus": "#D9ACDE",
-        "Species": "#9DEECF",
+        "Order": "#304E4F",
+        "Family": "#F5F5DC",
+        "Genus": "#DDA0DD",
+        "Species": "#76EEC6",
     }
 
     summary["resolved_rank"] = summary["resolved_rank"].astype(str).str.title().replace({"Higher": "Order"})
@@ -2596,11 +2878,99 @@ def _filter_stations_for_sensor(
 
     return out
 
+def _effort_grid(n_units: int, n_points: int = 160) -> np.ndarray:
+    """Effort values to evaluate a rarefaction curve on, always including 0 and n_units."""
+    if n_units <= n_points:
+        return np.arange(0, n_units + 1)
+    grid = np.linspace(0.0, float(n_units), num=n_points).round().astype(int)
+    return np.unique(np.concatenate(([0], grid, [n_units])))
+
+
+def _expected_richness(incidence_counts: np.ndarray, n_units: int, grid: np.ndarray) -> np.ndarray:
+    """Sample-based rarefaction: expected species richness for t of n_units samples.
+
+    Uses the analytical form (Chao et al. 2014): with ``Y_i`` sampling units
+    containing species ``i``, the chance of missing that species in ``t`` units
+    is ``C(T - Y_i, t) / C(T, t)``, so expected richness is the sum of detection
+    probabilities. Evaluated through log-factorials to stay stable for large
+    effort.
+    """
+    counts = np.asarray(incidence_counts, dtype=int)
+    counts = counts[counts > 0]
+    if n_units <= 0 or counts.size == 0:
+        return np.zeros(len(grid), dtype=float)
+
+    log_factorial = np.concatenate(([0.0], np.cumsum(np.log(np.arange(1, n_units + 1, dtype=float)))))
+    absent = (n_units - counts)[:, None]
+    t = np.asarray(grid, dtype=int)[None, :]
+
+    # Species i can only be missed entirely while t <= T - Y_i.
+    reachable = t <= absent
+    log_miss = np.where(
+        reachable,
+        log_factorial[np.where(reachable, absent, 0)]
+        - log_factorial[np.where(reachable, absent - t, 0)]
+        - log_factorial[n_units]
+        + log_factorial[n_units - t],
+        -np.inf,
+    )
+    return (1.0 - np.exp(log_miss)).sum(axis=0)
+
+
+def _bootstrap_richness_se(
+    incidence_counts: np.ndarray,
+    n_units: int,
+    grid: np.ndarray,
+    *,
+    n_bootstrap: int = 200,
+    seed: int = 42,
+) -> np.ndarray:
+    """Standard error of the rarefaction curve, via the iNEXT bootstrap scheme.
+
+    Resampling the observed sampling units cannot produce more species than were
+    seen, which pins the upper bound to the estimate at full effort. Instead this
+    follows Chao et al. (2014): observed species get coverage-corrected detection
+    probabilities, the undetected species implied by the Chao2 estimate share the
+    leftover probability mass, and each replicate redraws incidences from that
+    community.
+    """
+    counts = np.asarray(incidence_counts, dtype=float)
+    counts = counts[counts > 0]
+    if counts.size == 0 or n_units <= 0 or n_bootstrap <= 1:
+        return np.zeros(len(grid), dtype=float)
+
+    units = float(n_units)
+    q1 = float(np.count_nonzero(counts == 1))
+    q2 = float(np.count_nonzero(counts == 2))
+    if q2 > 0:
+        f0 = (units - 1) / units * q1 * q1 / (2 * q2)
+    else:
+        f0 = (units - 1) / units * q1 * (q1 - 1) / 2
+    f0 = max(f0, 0.0)
+
+    detection = counts / units
+    undetected_share = np.power(1.0 - detection, units)
+    unseen_mass = q1 / units * (units * f0 / (units * f0 + q1)) if q1 > 0 and f0 > 0 else 0.0
+    spread = float(np.sum(detection * undetected_share))
+    correction = unseen_mass / spread if spread > 0 else 0.0
+
+    probs = np.clip(detection * (1.0 - correction * undetected_share), 1e-12, 1.0)
+    n_unseen = int(np.ceil(f0))
+    if n_unseen > 0 and unseen_mass > 0:
+        probs = np.concatenate([probs, np.full(n_unseen, np.clip(unseen_mass / n_unseen, 1e-12, 1.0))])
+
+    rng = np.random.default_rng(seed)
+    replicates = np.empty((n_bootstrap, len(grid)), dtype=float)
+    for i in range(n_bootstrap):
+        replicates[i] = _expected_richness(rng.binomial(n_units, probs), n_units, grid)
+    return replicates.std(axis=0, ddof=1)
+
+
 def _incidence_species_accumulation_curve(
     observations_df: pd.DataFrame,
     stations_df: pd.DataFrame,
     *,
-    n_permutations: int = 200,
+    n_bootstrap: int = 200,
     random_seed: int = 42,
     use_r_inext: bool = False,
     clip_stations_to_observations: bool = True,
@@ -2621,81 +2991,52 @@ def _incidence_species_accumulation_curve(
     if all_days.empty:
         return pd.DataFrame(columns=["x", "mean", "lower", "upper"])
 
-    ts_col = _timestamp_column(observations_df)
-    if ts_col is None or "device_id" not in observations_df.columns:
-        return pd.DataFrame(
-            {
-                "x": np.arange(1, len(all_days) + 1),
-                "mean": np.zeros(len(all_days)),
-                "lower": np.zeros(len(all_days)),
-                "upper": np.zeros(len(all_days)),
-            }
-        )
+    samples = all_days.drop_duplicates(["device_id", "date"]).reset_index(drop=True)
+    n_units = len(samples)
 
+    def _flat_curve() -> pd.DataFrame:
+        grid = _effort_grid(n_units)
+        zeros = np.zeros(len(grid), dtype=float)
+        return pd.DataFrame({"x": grid, "mean": zeros, "lower": zeros, "upper": zeros})
+
+    ts_col = _timestamp_column(observations_df)
     species_col = "common_name" if "common_name" in observations_df.columns else "species"
-    if species_col not in observations_df.columns:
-        return pd.DataFrame(
-            {
-                "x": np.arange(1, len(all_days) + 1),
-                "mean": np.zeros(len(all_days)),
-                "lower": np.zeros(len(all_days)),
-                "upper": np.zeros(len(all_days)),
-            }
-        )
+    if ts_col is None or "device_id" not in observations_df.columns or species_col not in observations_df.columns:
+        return _flat_curve()
 
     obs = observations_df[["device_id", ts_col, species_col]].copy()
     obs["date"] = pd.to_datetime(obs[ts_col], errors="coerce", utc=True).dt.tz_convert(None).dt.normalize()
     obs["species"] = obs[species_col].fillna("").astype(str).str.strip()
     obs = obs.dropna(subset=["date"])
     obs = obs[obs["species"] != ""]
+    if obs.empty or n_units == 0:
+        return _flat_curve()
 
-    samples = all_days.drop_duplicates(["device_id", "date"]).reset_index(drop=True)
-    if obs.empty:
-        n_samples = len(samples)
-        return pd.DataFrame(
-            {
-                "x": np.arange(1, n_samples + 1),
-                "mean": np.zeros(n_samples),
-                "lower": np.zeros(n_samples),
-                "upper": np.zeros(n_samples),
-            }
-        )
-
+    # Species-by-sampling-unit incidence matrix over the effort timeline.
     obs_unique = obs[["device_id", "date", "species"]].drop_duplicates()
-    merged = samples.merge(obs_unique, on=["device_id", "date"], how="left")
+    samples = samples.reset_index(names="_unit")
+    merged = obs_unique.merge(samples, on=["device_id", "date"], how="inner")
+    if merged.empty:
+        return _flat_curve()
 
-    species_per_sample = (
-        merged.dropna(subset=["species"])  # keep only observed incidences
-        .groupby(level=0)["species"]
-        .agg(lambda s: set(s.astype(str)))
-        .reindex(range(len(samples)), fill_value=set())
-        .tolist()
+    incidence = (
+        pd.crosstab(merged["species"], merged["_unit"])
+        .reindex(columns=range(n_units), fill_value=0)
+        .to_numpy()
+        > 0
     )
 
-    n_samples = len(species_per_sample)
-    if n_samples == 0:
-        return pd.DataFrame(columns=["x", "mean", "lower", "upper"])
-
-    rng = np.random.default_rng(random_seed)
-    curves = np.zeros((n_permutations, n_samples), dtype=float)
-
-    for i in range(n_permutations):
-        order = rng.permutation(n_samples)
-        seen: set[str] = set()
-        for j, sample_idx in enumerate(order):
-            seen.update(species_per_sample[sample_idx])
-            curves[i, j] = len(seen)
-
-    mean = curves.mean(axis=0)
-    lower = np.percentile(curves, 2.5, axis=0)
-    upper = np.percentile(curves, 97.5, axis=0)
+    grid = _effort_grid(n_units)
+    counts = incidence.sum(axis=1)
+    mean = _expected_richness(counts, n_units, grid)
+    se = _bootstrap_richness_se(counts, n_units, grid, n_bootstrap=n_bootstrap, seed=random_seed)
 
     return pd.DataFrame(
         {
-            "x": np.arange(1, n_samples + 1),
+            "x": grid,
             "mean": mean,
-            "lower": lower,
-            "upper": upper,
+            "lower": np.clip(mean - 1.96 * se, 0.0, None),
+            "upper": mean + 1.96 * se,
         }
     )
 
@@ -2801,7 +3142,7 @@ def save_all_figures(
         except Exception:
             fig = _empty_figure(f"No sampling locations available for {sensor}")
         path = _path(key)
-        fig.savefig(path, dpi=dpi, bbox_inches="tight", facecolor="#ffffff")
+        fig.savefig(path, dpi=dpi, bbox_inches="tight", facecolor=fig.get_facecolor())
         plt.close(fig)
         saved[key] = str(path)
 

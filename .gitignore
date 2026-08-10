@@ -23,6 +23,7 @@ wheels/
 *.egg-info/
 .installed.cfg
 *.egg
+.preview/
 
 # PyInstaller
 *.manifest
@@ -86,3 +87,5 @@ dmypy.json
 # uv
 .python-version
 uv.lock
+
+.mplcache/

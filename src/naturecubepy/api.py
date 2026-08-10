@@ -327,6 +327,8 @@ def get_station_info(hdr: AuthHeaders, measurement_type: str | None) -> gpd.GeoD
     for mt_key, datatypes in requested.items():
         for datatype in datatypes:
             gdf = fetch_station_features(hdr, datatype)
+            if gdf.empty:
+                continue
             if "measurement_type" in gdf.columns:
                 mask = gdf["measurement_type"].astype(str).str.strip().str.lower() == mt_key
                 dfs.append(gdf[mask])
@@ -606,6 +608,8 @@ def normalise_psr_ids(project_system_record_ids: int | list[int]) -> list[int]:
 
 def build_station_lookup(stations: gpd.GeoDataFrame, data_type: str) -> pd.DataFrame:
     """Build a flat station lookup table with location metadata."""
+    if stations.empty:
+        return pd.DataFrame(columns=STATION_LOOKUP_COLUMNS)
     if "project_system_record_id" not in stations.columns:
         raise ValueError(
             "Station data does not contain 'project_system_record_id'. "
