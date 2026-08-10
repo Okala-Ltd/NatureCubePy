@@ -86,6 +86,5 @@ dmypy.json
 
 # uv
 .python-version
-uv.lock
 
 .mplcache/
