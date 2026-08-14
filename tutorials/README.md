@@ -8,7 +8,7 @@ Step-by-step guides for using NatureCubePy with the Okala API.
 |----------|--------|-------------|
 | [01 - Authentication](01_authentication.ipynb) | Notebook | Set up API keys and connect to Okala |
 | [02 - Data Retrieval](02_data_retrieval.ipynb) | Notebook | Retrieve stations, labels, and observation datasets |
-| [03 - Data Upload](03_data_upload.ipynb) | Notebook | Update observations and labels |
+| [03 - Data Upload](03_data_upload.ipynb) | Notebook | Update labels, timestamps, eDNA, and phone observations from CSV |
 | [04 - Visualization](04_visualization.ipynb) | Notebook | Plot stations, species, accumulation, and eDNA |
 
 ## Requirements
