@@ -825,8 +825,8 @@ class TestCsvUploadWorkflow:
 
         assert built["observations"][0]["values"] == {"u-label": "Vulpes vulpes", "u-count": 3}
 
-    def test_validate_flags_multi_value_choice_cell(self, tmp_path: Path):
-        """A combined choice cell like 'calling;land' is reported, not silently accepted."""
+    def test_validate_accepts_multi_value_choice_cell(self, tmp_path: Path):
+        """A combined choice cell like 'calling;land' is valid when each part matches."""
         from naturecubepy.phone_observations import (
             get_procedure,
             validate_csv_against_procedure,
@@ -865,8 +865,9 @@ class TestCsvUploadWorkflow:
         csv_path = tmp_path / "beh.csv"
         csv_path.write_text(
             "longitude,latitude,timestamp,behavior\n"
-            "-1.43,52.72,24/04/2015 07:15,Calling\n"      # single, different case -> ok
-            "-1.45,52.74,24/04/2015 07:15,calling;land\n",  # multi -> error
+            "-1.43,52.72,24/04/2015 07:15,Calling\n"
+            "-1.45,52.74,24/04/2015 07:15,calling;land\n"
+            "-1.46,52.75,24/04/2015 07:15,calling;unknown\n",
             encoding="utf-8",
         )
 
@@ -875,8 +876,8 @@ class TestCsvUploadWorkflow:
         assert result["valid"] is False
         issues = result["type_issues"]
         assert len(issues) == 1
-        assert issues.iloc[0]["value"] == "calling;land"
-        assert "multiple values" in issues.iloc[0]["problem"]
+        assert issues.iloc[0]["value"] == "calling;unknown"
+        assert "'unknown'" in issues.iloc[0]["problem"]
 
     @staticmethod
     def _choice_schema() -> dict:
@@ -915,11 +916,10 @@ class TestCsvUploadWorkflow:
             ]
         }
 
-    def test_split_multi_value_choices_wide(self):
+    def test_build_multi_value_choice_as_list_wide(self):
         from naturecubepy.phone_observations import (
             build_upload_observations_from_table,
             get_procedure,
-            split_multi_value_choices,
         )
 
         procedure = get_procedure(self._choice_schema(), system_id=434, procedure_id=863)
@@ -942,46 +942,48 @@ class TestCsvUploadWorkflow:
             ]
         )
 
-        split = split_multi_value_choices(data, procedure=procedure)
-
-        # Blackcap's two behaviors expand to two rows; Robin stays one.
-        assert len(split) == 3
-        assert split["observation_id"].nunique() == 3
-        assert list(split["behavior"]) == ["calling", "land", "singing"]
-
         built = build_upload_observations_from_table(
-            split, procedure=procedure, recorded_at_format="%d/%m/%Y %H:%M"
+            data, procedure=procedure, recorded_at_format="%d/%m/%Y %H:%M"
         )
-        assert len(built["observations"]) == 3
+        assert len(built["observations"]) == 2
         values = [obs["values"] for obs in built["observations"]]
-        assert {"u-label": "Blackcap", "u-beh": "calling"} in values
-        assert {"u-label": "Blackcap", "u-beh": "land"} in values
+        assert {"u-label": "Blackcap", "u-beh": ["calling", "land"]} in values
+        assert {"u-label": "Robin", "u-beh": "singing"} in values
 
-    def test_split_multi_value_choices_long_duplicates_group(self):
+    def test_build_multi_value_choice_as_list_long(self):
         from naturecubepy.phone_observations import (
             build_upload_observations_from_table,
             get_procedure,
-            split_multi_value_choices,
         )
 
         procedure = get_procedure(self._choice_schema(), system_id=434, procedure_id=863)
         data = pd.DataFrame(
             [
-                {"longitude": -1.43, "latitude": 52.72, "recorded_at": "24/04/2015 07:15", "item_name": "label", "data": "Blackcap"},
-                {"longitude": -1.43, "latitude": 52.72, "recorded_at": "24/04/2015 07:15", "item_name": "behavior", "data": "calling;land"},
+                {
+                    "longitude": -1.43,
+                    "latitude": 52.72,
+                    "recorded_at": "24/04/2015 07:15",
+                    "item_name": "label",
+                    "data": "Blackcap",
+                },
+                {
+                    "longitude": -1.43,
+                    "latitude": 52.72,
+                    "recorded_at": "24/04/2015 07:15",
+                    "item_name": "behavior",
+                    "data": "calling;land",
+                },
             ]
         )
 
-        split = split_multi_value_choices(data, procedure=procedure)
-
         built = build_upload_observations_from_table(
-            split, procedure=procedure, recorded_at_format="%d/%m/%Y %H:%M"
+            data, procedure=procedure, recorded_at_format="%d/%m/%Y %H:%M"
         )
-        # Each behavior becomes its own observation, both carrying the label.
-        assert len(built["observations"]) == 2
-        for obs in built["observations"]:
-            assert obs["values"]["u-label"] == "Blackcap"
-        assert {obs["values"]["u-beh"] for obs in built["observations"]} == {"calling", "land"}
+        assert len(built["observations"]) == 1
+        assert built["observations"][0]["values"] == {
+            "u-label": "Blackcap",
+            "u-beh": ["calling", "land"],
+        }
 
     def test_build_from_wide_table_without_matching_columns(self):
         """A wide sheet sharing no headers with the procedure explains itself."""

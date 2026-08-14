@@ -8,7 +8,6 @@ to the Okala platform.
 
 from __future__ import annotations
 
-import itertools
 import json
 import mimetypes
 import re
@@ -1044,6 +1043,26 @@ def _canonical_choice(value: str, valid_choices: list[str]) -> str | None:
     return lookup.get(_normalize_lookup_value(value))
 
 
+def _coerce_choice_value(
+    raw: Any,
+    valid_choices: list[str] | None = None,
+) -> str | list[str] | None:
+    """Turn a choice cell into a scalar or list for ``uploadObservations``.
+
+    Cells may hold several selections separated by ``;`` or ``|``
+    (e.g. ``calling;land``). Multiple selections become a list so they upload
+    as one observation; a single selection stays a string. When
+    ``valid_choices`` is provided, each part is rewritten to the procedure's
+    spelling (case-insensitive match).
+    """
+    parts = _split_multi_value(raw)
+    if not parts:
+        return None
+    if valid_choices:
+        parts = [_canonical_choice(part, valid_choices) or part for part in parts]
+    return parts if len(parts) > 1 else parts[0]
+
+
 def _check_value_against_type(
     *,
     item_name_norm: str,
@@ -1068,17 +1087,12 @@ def _check_value_against_type(
     elif "choice" in dt_lower:
         choices_raw = ch_lookup.get(item_name_norm, "")
         parts = _split_multi_value(effective_val)
-        if len(parts) > 1:
-            # The API stores one choice per item, so a combined cell such as
-            # 'calling;land' must be split into separate records upstream.
-            problem = (
-                f"multiple values '{effective_val}' in a single choice cell are not "
-                "supported; put each selection in its own row"
-            )
-        elif choices_raw:
+        if choices_raw and parts:
             valid_choices = [c.strip() for c in choices_raw.split("|") if c.strip()]
-            if _canonical_choice(effective_val, valid_choices) is None:
-                problem = f"'{effective_val}' not in choices: {' | '.join(valid_choices)}"
+            bad = [p for p in parts if _canonical_choice(p, valid_choices) is None]
+            if bad:
+                quoted = ", ".join(f"'{b}'" for b in bad)
+                problem = f"{quoted} not in choices: {' | '.join(valid_choices)}"
     if not problem:
         return None
     return {
@@ -1357,172 +1371,27 @@ def validate_csv_against_procedure(
     return result
 
 
-def _procedure_choice_map(procedure: dict[str, Any]) -> dict[str, list[str]]:
-    """Map normalised choice-item names to their list of valid choices."""
-    items = procedure.get("items")
-    if not isinstance(items, pd.DataFrame) or items.empty:
+def _choice_values_by_uuid(items: pd.DataFrame) -> dict[str, list[str]]:
+    """Map choice-item UUIDs to their procedure choice labels."""
+    if items is None or items.empty:
         return {}
-    if "data_type" not in items.columns or "choices" not in items.columns:
+    if "data_type" not in items.columns or "item_uuid" not in items.columns:
         return {}
-    choice_map: dict[str, list[str]] = {}
-    for name, dtype, choices_raw in zip(
-        items["item_name"], items["data_type"], items["choices"].fillna(""), strict=False
+    has_choices = "choices" in items.columns
+    out: dict[str, list[str]] = {}
+    for uid, dtype, choices_raw in zip(
+        items["item_uuid"],
+        items["data_type"],
+        items["choices"].fillna("") if has_choices else [""] * len(items),
+        strict=False,
     ):
-        if "choice" in str(dtype).lower():
-            choice_map[_normalize_lookup_value(name)] = [
-                c.strip() for c in str(choices_raw).split("|") if c.strip()
-            ]
-    return choice_map
-
-
-def split_multi_value_choices(
-    data: pd.DataFrame,
-    *,
-    procedure: dict[str, Any] | None = None,
-    schema: dict[str, Any] | None = None,
-    system_name: str | None = None,
-    procedure_name: str | None = None,
-    system_index: int | None = None,
-    procedure_index: int | None = None,
-    system_id: int | None = None,
-    procedure_id: int | None = None,
-    format: str = "auto",
-    item_name_col: str = "item_name",
-    value_col: str = "data",
-    lon_col: str = "longitude",
-    lat_col: str = "latitude",
-    recorded_at_col: str = "recorded_at",
-    observation_id_col: str = "observation_id",
-    canonicalize: bool = True,
-) -> pd.DataFrame:
-    """Expand multi-select choice cells into separate, uploadable observations.
-
-    A cell such as ``calling;land`` (parts separated by ``;`` or ``|``) is split
-    so each selection becomes its own observation, duplicating the row's other
-    fields. This is needed because ``uploadObservations`` stores a single value
-    per item, so multiple selections must be uploaded as distinct records.
-
-    Works on both layouts (auto-detected unless ``format`` is set):
-
-    - **wide** — each choice column is exploded; every combination of selections
-      becomes one output row (one observation).
-    - **long** — rows are grouped into observations (by ``observation_id`` or by
-      coordinates + timestamp), then each choice selection produces a full copy
-      of the group with a unique ``observation_id``.
-
-    The result is ready to pass to :func:`build_upload_observations_from_table`
-    or :func:`upload_observations_from_csv`.
-    """
-    if data is None or data.empty:
-        raise ValueError("data must be a non-empty DataFrame")
-    if format not in {"auto", "long", "wide"}:
-        raise ValueError("format must be one of: auto, long, wide")
-
-    if procedure is None:
-        if schema is None:
-            raise ValueError("Provide either a procedure or a schema to resolve choices")
-        procedure = get_procedure(
-            schema,
-            system_name=system_name,
-            procedure_name=procedure_name,
-            system_index=system_index,
-            procedure_index=procedure_index,
-            system_id=system_id,
-            procedure_id=procedure_id,
-        )
-    choice_map = _procedure_choice_map(procedure)
-
-    data = _clean_headers(data)
-    item_name_col = _resolve_column(data.columns, item_name_col)
-    value_col = _resolve_column(data.columns, value_col)
-    lon_col = _resolve_column(data.columns, lon_col)
-    lat_col = _resolve_column(data.columns, lat_col)
-    recorded_at_col = _resolve_column(data.columns, recorded_at_col)
-    observation_id_col = _resolve_column(data.columns, observation_id_col)
-
-    detected = format
-    if detected == "auto":
-        detected = "long" if item_name_col in data.columns else "wide"
-
-    if not choice_map:
-        return data.reset_index(drop=True)
-
-    def _selections(raw: Any, valid_choices: list[str]) -> list[str]:
-        parts = _split_multi_value(raw)
-        if not parts:
-            return [str(raw)]
-        return [(_canonical_choice(p, valid_choices) or p) if canonicalize else p for p in parts]
-
-    if detected == "wide":
-        choice_cols = [c for c in data.columns if _normalize_lookup_value(c) in choice_map]
-        work = data.copy()
-        for col in choice_cols:
-            valid_choices = choice_map[_normalize_lookup_value(col)]
-            work[col] = [_selections(v, valid_choices) for v in work[col]]
-            work = work.explode(col, ignore_index=True)
-        # Give every resulting row a distinct id so build() treats each as its
-        # own observation rather than merging on coordinates and timestamp.
-        work[observation_id_col] = [f"row-{i + 1}" for i in range(len(work))]
-        return work.reset_index(drop=True)
-
-    # long format: expand within each observation group
-    work = data.copy()
-    if observation_id_col in work.columns:
-        gids = work[observation_id_col].fillna("").astype(str).str.strip()
-    else:
-        gids = pd.Series([""] * len(work), index=work.index)
-    lon_series = work[lon_col].astype(str) if lon_col in work.columns else pd.Series([""] * len(work), index=work.index)
-    lat_series = work[lat_col].astype(str) if lat_col in work.columns else pd.Series([""] * len(work), index=work.index)
-    ts_series = (
-        work[recorded_at_col].astype(str)
-        if recorded_at_col in work.columns
-        else pd.Series([""] * len(work), index=work.index)
-    )
-    work = work.assign(
-        _gid=[
-            gid if gid else f"{lo}::{la}::{ts}"
-            for gid, lo, la, ts in zip(gids, lon_series, lat_series, ts_series, strict=False)
-        ]
-    )
-
-    def _is_choice_row(row: pd.Series) -> bool:
-        return _normalize_lookup_value(row.get(item_name_col, "")) in choice_map
-
-    out_rows: list[dict[str, Any]] = []
-    for gid, group in work.groupby("_gid", sort=False):
-        base_rows: list[dict[str, Any]] = []
-        multi_rows: list[tuple[dict[str, Any], list[str]]] = []
-        for _, row in group.iterrows():
-            record = row.drop(labels="_gid").to_dict()
-            if _is_choice_row(row):
-                valid_choices = choice_map[_normalize_lookup_value(row[item_name_col])]
-                sels = _selections(row.get(value_col, ""), valid_choices)
-                if len(sels) > 1:
-                    multi_rows.append((record, sels))
-                    continue
-                if canonicalize and sels:
-                    record[value_col] = sels[0]
-            base_rows.append(record)
-
-        if not multi_rows:
-            for record in base_rows:
-                record[observation_id_col] = str(gid)
-                out_rows.append(record)
+        if "choice" not in str(dtype).lower():
             continue
-
-        for combo_idx, combo in enumerate(itertools.product(*[sels for _, sels in multi_rows]), start=1):
-            oid = f"{gid}::{combo_idx}"
-            for record in base_rows:
-                new_record = dict(record)
-                new_record[observation_id_col] = oid
-                out_rows.append(new_record)
-            for (record, _), selected in zip(multi_rows, combo, strict=False):
-                new_record = dict(record)
-                new_record[value_col] = selected
-                new_record[observation_id_col] = oid
-                out_rows.append(new_record)
-
-    return pd.DataFrame(out_rows).reset_index(drop=True)
+        uid_str = str(uid).strip()
+        if not uid_str:
+            continue
+        out[uid_str] = [c.strip() for c in str(choices_raw).split("|") if c.strip()]
+    return out
 
 
 def build_observation_record(
@@ -1906,6 +1775,11 @@ def build_upload_observations_from_table(
         )
         if str(uid)
     }
+    choice_by_uuid = (
+        _choice_values_by_uuid(procedure["items"])
+        if use_procedure and isinstance(procedure, dict)
+        else {}
+    )
     resolved_from_name = [
         name_lookup.get(_normalize_lookup_value(name), "") for name in work[item_name_col]
     ]
@@ -1990,6 +1864,14 @@ def build_upload_observations_from_table(
                             ),
                         }
                     )
+                continue
+            if "choice" in data_type and value_text:
+                coerced = _coerce_choice_value(
+                    value_text, choice_by_uuid.get(item_uuid) or None
+                )
+                if coerced is None:
+                    continue
+                chunk_values[item_uuid] = coerced
                 continue
             if value_text:
                 value_to_use: Any = value_text
