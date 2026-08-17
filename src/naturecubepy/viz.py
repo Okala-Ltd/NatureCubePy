@@ -1202,6 +1202,97 @@ def station_explorer(
     return m
 
 
+# Deployment spans are plotted against a single reference year so that seasons
+# from different years sit on a shared month axis. 2000 is a leap year, so a
+# 29 February never has to be moved.
+_PLOT_YEAR = 2000
+
+
+def _split_spans_by_year(
+    starts: pd.Series,
+    ends: pd.Series,
+) -> pd.DataFrame:
+    """
+    Cut each start/end span into one piece per calendar year it covers.
+
+    Parameters
+    ----------
+    starts, ends:
+        Matching series of span bounds.
+
+    Returns
+    -------
+    A frame of one row per piece, with the calendar year it belongs to, the
+    bounds mapped onto the shared reference year, and flags marking whether the
+    piece carries the real start and end of the span.
+    """
+
+    def to_plot_year(stamp):
+        return pd.Timestamp(
+            year=_PLOT_YEAR,
+            month=stamp.month,
+            day=stamp.day,
+        )
+
+
+    pieces = []
+
+    for start, end in zip(starts, ends):
+
+        for year in range(start.year, end.year + 1):
+
+            year_opens = pd.Timestamp(
+                year=year,
+                month=1,
+                day=1,
+            )
+
+            # Held one second short of midnight so a span ending on 31 December
+            # is not mistaken for one carrying on into the next year.
+            year_closes = pd.Timestamp(
+                year=year,
+                month=12,
+                day=31,
+                hour=23,
+                minute=59,
+                second=59,
+            )
+
+            piece_start = max(start, year_opens)
+            piece_end = min(end, year_closes)
+
+            pieces.append({
+                "year": year,
+                "start_plot": to_plot_year(piece_start),
+                "end_plot": to_plot_year(piece_end),
+                "carries_start": piece_start == start,
+                "carries_end": piece_end == end,
+            })
+
+
+    return (
+        pd.DataFrame(
+            pieces,
+            columns=[
+                "year",
+                "start_plot",
+                "end_plot",
+                "carries_start",
+                "carries_end",
+            ],
+        )
+        .astype({
+            "year": int,
+            "start_plot": "datetime64[ns]",
+            "end_plot": "datetime64[ns]",
+            "carries_start": bool,
+            "carries_end": bool,
+        })
+        .sort_values(["year", "start_plot"])
+        .reset_index(drop=True)
+    )
+
+
 def camera_activity_timeline(
     df: pd.DataFrame,
     *,
@@ -1217,6 +1308,11 @@ def camera_activity_timeline(
 ):
     """
     Plot camera deployment activity timeline.
+
+    Deployments share one month axis so seasons can be compared, and are
+    stacked into a shaded band per calendar year. A deployment running over New
+    Year is cut at the boundary and appears in both bands, with an arrow in the
+    margin pointing to the band holding the rest of it.
 
     Parameters
     ----------
@@ -1385,23 +1481,50 @@ def camera_activity_timeline(
     )
 
 
+    # Everything is drawn on one calendar year so seasons line up, which leaves
+    # nowhere to put a deployment that runs over New Year. Each one is cut at
+    # the year boundary instead and every piece is stacked in the band of the
+    # year it actually ran in, so a winter deployment reads as a row closing out
+    # December and a row opening January in the band above.
+    segments = _split_spans_by_year(
+        timeline["start"],
+        timeline["end"],
+    )
+
+
+    year_opens = pd.Timestamp(
+        year=_PLOT_YEAR,
+        month=1,
+        day=1,
+    )
+
+    year_closes = pd.Timestamp(
+        year=_PLOT_YEAR,
+        month=12,
+        day=31,
+    )
+
+
     years = sorted(
-        timeline["year"].unique()
+        segments["year"].unique()
     )
 
 
     # ---- stack rows ----
-    y = np.zeros(len(timeline))
+    y = np.zeros(len(segments))
 
     centers = {}
     cursor = 0
-    gap = 0
+
+    # An empty slot between bands keeps the year labels apart when a year only
+    # holds one or two deployments.
+    gap = 1
 
 
     for year in years:
 
-        idx = timeline.index[
-            timeline["year"] == year
+        idx = segments.index[
+            segments["year"] == year
         ]
 
         values = cursor + np.arange(len(idx))
@@ -1456,8 +1579,8 @@ def camera_activity_timeline(
 
     for year in years:
 
-        idx = timeline.index[
-            timeline["year"] == year
+        idx = segments.index[
+            segments["year"] == year
         ]
 
         ax.axhspan(
@@ -1473,8 +1596,8 @@ def camera_activity_timeline(
         tracked_days = sorted({
             day
             for start, end in zip(
-                timeline["start_plot"],
-                timeline["end_plot"],
+                segments["start_plot"],
+                segments["end_plot"],
             )
             for day in pd.date_range(start, end, freq="D")
         })
@@ -1489,8 +1612,8 @@ def camera_activity_timeline(
             )
 
 
-    starts = mdates.date2num(timeline["start_plot"])
-    ends = mdates.date2num(timeline["end_plot"])
+    starts = mdates.date2num(segments["start_plot"])
+    ends = mdates.date2num(segments["end_plot"])
 
     # date2num is in days, so a same-day deployment still gets a visible bar.
     widths = np.maximum(ends - starts, 1.0)
@@ -1498,7 +1621,7 @@ def camera_activity_timeline(
 
     for year in years:
 
-        mask = (timeline["year"] == year).to_numpy()
+        mask = (segments["year"] == year).to_numpy()
 
         ax.barh(
             y[mask],
@@ -1512,11 +1635,16 @@ def camera_activity_timeline(
         )
 
 
+    # Only the pieces holding the real bounds get a dot, so a bar cut at the
+    # year boundary is not read as a deployment that stopped on 31 December.
+    carries_start = segments["carries_start"].to_numpy()
+    carries_end = segments["carries_end"].to_numpy()
+
     # Contrasting hues with a dark outline so both stay readable wherever they
     # land, on a dark bar or on a light year band.
     ax.scatter(
-        timeline["start_plot"],
-        y,
+        starts[carries_start],
+        y[carries_start],
         s=marker_size,
         color="#76EEC6",
         edgecolor="#093939",
@@ -1526,8 +1654,8 @@ def camera_activity_timeline(
     )
 
     ax.scatter(
-        timeline["end_plot"],
-        y,
+        ends[carries_end],
+        y[carries_end],
         s=marker_size,
         color="#DDA0DD",
         edgecolor="#093939",
@@ -1537,14 +1665,42 @@ def camera_activity_timeline(
     )
 
 
+    # Arrows in the axis margin point at the band holding the rest of the
+    # deployment: one running out of December reappears in the band above.
+    carry_over = [
+        (~carries_end, ">", mdates.date2num(year_closes) + 3.0),
+        (~carries_start, "<", mdates.date2num(year_opens) - 3.0),
+    ]
+
+    carry_label = "Crosses year"
+
+    for mask, marker, position in carry_over:
+
+        if not mask.any():
+            continue
+
+        ax.scatter(
+            np.full(int(mask.sum()), position),
+            y[mask],
+            s=marker_size,
+            marker=marker,
+            color=CORE_PALETTE[3],
+            edgecolor="#093939",
+            linewidth=0.8,
+            zorder=3,
+            label=carry_label,
+        )
+
+        carry_label = None
+
+
     for year in years:
 
         ax.text(
-            -0.01,
+            -0.012,
             centers[year],
             str(year),
             transform=ax.get_yaxis_transform(),
-            rotation=90,
             ha="right",
             va="center",
             fontsize=11,
@@ -1554,13 +1710,13 @@ def camera_activity_timeline(
         )
 
 
-    # Pad the year so a marker sitting on 1 Jan or 31 Dec is not clipped in
-    # half by the edge of the axes.
-    axis_pad = pd.Timedelta(days=5)
+    # Pad the year so neither a marker sitting on 1 Jan or 31 Dec nor a
+    # crosses-year arrow in the margin is clipped by the edge of the axes.
+    axis_pad = pd.Timedelta(days=7)
 
     ax.set_xlim(
-        pd.Timestamp("2000-01-01") - axis_pad,
-        pd.Timestamp("2000-12-31") + axis_pad,
+        year_opens - axis_pad,
+        year_closes + axis_pad,
     )
 
     # Match the year bands exactly so no white strip shows above the x axis.
@@ -1624,7 +1780,7 @@ def camera_activity_timeline(
         fontsize=font_size,
         loc="lower right",
         bbox_to_anchor=(1.0, 1.01),
-        ncol=2,
+        ncol=3,
         frameon=True,
         facecolor="white",
         edgecolor=CORE_PALETTE[3],
@@ -3104,7 +3260,8 @@ def save_all_figures(
     """Generate and save project figures using the plotters in this module.
 
     Only emits figures for sensors present in ``sensor_types`` (or
-    ``bundle.sensor_types`` when omitted).
+    ``bundle.sensor_types`` when omitted). Sensors / frames with no data are
+    skipped with a terminal warning — empty placeholder figures are not written.
 
     When ``filename_prefix`` is set, files are named
     ``{prefix}_{key}.png``; dict keys remain the logical ``key``.
@@ -3117,6 +3274,18 @@ def save_all_figures(
 
     def _path(key: str) -> Path:
         return out / f"{prefix}{key}.png"
+
+    def _skip(key: str, reason: str) -> None:
+        print(f"Warning: {reason}; not writing figure '{key}'.")
+        path = _path(key)
+        if path.exists():
+            path.unlink()
+
+    def _save(key: str, fig) -> None:
+        path = _path(key)
+        fig.savefig(path, dpi=dpi, bbox_inches="tight", facecolor=fig.get_facecolor())
+        plt.close(fig)
+        saved[key] = str(path)
 
     map_specs = [("all_sampling_locations", "all")]
     if "camera" in selected:
@@ -3132,6 +3301,9 @@ def save_all_figures(
             if sensor == "all"
             else _filter_stations_by_sensor(bundle.stations, sensor)
         )
+        if stations is None or stations.empty:
+            _skip(key, f"no sampling locations for {sensor}")
+            continue
         try:
             fig = station_map(
                 stations,
@@ -3139,12 +3311,10 @@ def save_all_figures(
                 project_boundary=project_boundary,
                 logo_path=logo_path,
             )
-        except Exception:
-            fig = _empty_figure(f"No sampling locations available for {sensor}")
-        path = _path(key)
-        fig.savefig(path, dpi=dpi, bbox_inches="tight", facecolor=fig.get_facecolor())
-        plt.close(fig)
-        saved[key] = str(path)
+        except Exception as exc:
+            _skip(key, f"could not build sampling map for {sensor} ({exc})")
+            continue
+        _save(key, fig)
 
     timeline_specs = []
     if "camera" in selected:
@@ -3154,62 +3324,81 @@ def save_all_figures(
 
     for key, sensor in timeline_specs:
         subset = _filter_stations_by_sensor(bundle.stations, sensor)
+        if subset is None or subset.empty:
+            _skip(key, f"no {sensor} timeline data")
+            continue
         try:
             fig, _ = camera_activity_timeline(subset)
-        except Exception:
-            fig = _empty_figure(f"No {sensor} timeline data available", figsize=(12, 5))
-        path = _path(key)
-        fig.savefig(path, dpi=dpi, bbox_inches="tight")
-        plt.close(fig)
-        saved[key] = str(path)
+        except Exception as exc:
+            _skip(key, f"could not build {sensor} timeline ({exc})")
+            continue
+        _save(key, fig)
 
-    class_levels = _ordered_class_levels(bundle.camera, bundle.bioacoustic)
+    class_levels = _ordered_class_levels(
+        bundle.camera if "camera" in selected else pd.DataFrame(),
+        bundle.bioacoustic if "bioacoustic" in selected else pd.DataFrame(),
+    )
     class_specs = []
     if "camera" in selected:
-        class_specs.append(("species_per_class_camera", bundle.camera))
+        class_specs.append(("species_per_class_camera", bundle.camera, "camera"))
     if "bioacoustic" in selected:
-        class_specs.append(("species_per_class_bioacoustic", bundle.bioacoustic))
-    for key, frame in class_specs:
+        class_specs.append(("species_per_class_bioacoustic", bundle.bioacoustic, "bioacoustic"))
+    for key, frame, label in class_specs:
+        if frame is None or frame.empty:
+            _skip(key, f"no {label} observation data for class figure")
+            continue
         fig = records_per_class(frame, class_levels=class_levels or ["Unknown"], class_colors=CLASS_COLORS)
-        path = _path(key)
-        fig.savefig(path, dpi=dpi, bbox_inches="tight")
-        plt.close(fig)
-        saved[key] = str(path)
+        _save(key, fig)
 
     if "camera" in selected or "bioacoustic" in selected:
+        cam_obs = bundle.camera if "camera" in selected else pd.DataFrame()
+        bio_obs = bundle.bioacoustic if "bioacoustic" in selected else pd.DataFrame()
         accumulation_figs = plot_species_accumulation_mammal_bird_by_sensor(
-            bundle.camera if "camera" in selected else pd.DataFrame(),
-            bundle.bioacoustic if "bioacoustic" in selected else pd.DataFrame(),
+            cam_obs,
+            bio_obs,
             bundle.stations,
         )
         if "camera" in selected:
-            path = _path("species_accumulation_mammal_bird_camera")
-            accumulation_figs["camera"].savefig(path, dpi=dpi, bbox_inches="tight")
+            key = "species_accumulation_mammal_bird_camera"
+            if cam_obs.empty:
+                _skip(key, "no camera observation data for accumulation figure")
+                plt.close(accumulation_figs["camera"])
+            else:
+                _save(key, accumulation_figs["camera"])
+        elif "camera" in accumulation_figs:
             plt.close(accumulation_figs["camera"])
-            saved["species_accumulation_mammal_bird_camera"] = str(path)
         if "bioacoustic" in selected:
-            path = _path("species_accumulation_mammal_bird_bioacoustic")
-            accumulation_figs["bioacoustic"].savefig(path, dpi=dpi, bbox_inches="tight")
+            key = "species_accumulation_mammal_bird_bioacoustic"
+            if bio_obs.empty:
+                _skip(key, "no bioacoustic observation data for accumulation figure")
+                plt.close(accumulation_figs["bioacoustic"])
+            else:
+                _save(key, accumulation_figs["bioacoustic"])
+        elif "bioacoustic" in accumulation_figs:
             plt.close(accumulation_figs["bioacoustic"])
-            saved["species_accumulation_mammal_bird_bioacoustic"] = str(path)
 
-        top_figs = plot_top_species_by_sensor(
-            bundle.camera if "camera" in selected else pd.DataFrame(),
-            bundle.bioacoustic if "bioacoustic" in selected else pd.DataFrame(),
-            top_n=top_n,
-        )
+        top_figs = plot_top_species_by_sensor(cam_obs, bio_obs, top_n=top_n)
         if "camera" in selected:
-            path = _path("top_mammal_bird_species_camera")
-            top_figs["camera"].savefig(path, dpi=dpi, bbox_inches="tight")
+            key = "top_mammal_bird_species_camera"
+            if cam_obs.empty:
+                _skip(key, "no camera observation data for top-species figure")
+                plt.close(top_figs["camera"])
+            else:
+                _save(key, top_figs["camera"])
+        elif "camera" in top_figs:
             plt.close(top_figs["camera"])
-            saved["top_mammal_bird_species_camera"] = str(path)
         if "bioacoustic" in selected:
-            path = _path("top_mammal_bird_species_bioacoustic")
-            top_figs["bioacoustic"].savefig(path, dpi=dpi, bbox_inches="tight")
+            key = "top_mammal_bird_species_bioacoustic"
+            if bio_obs.empty:
+                _skip(key, "no bioacoustic observation data for top-species figure")
+                plt.close(top_figs["bioacoustic"])
+            else:
+                _save(key, top_figs["bioacoustic"])
+        elif "bioacoustic" in top_figs:
             plt.close(top_figs["bioacoustic"])
-            saved["top_mammal_bird_species_bioacoustic"] = str(path)
 
     if "edna" in selected:
+        key = "edna_unique_taxa_stacked"
         if bundle.edna is not None and not bundle.edna.empty:
             edna_df = bundle.edna
         elif "measurement_type" in bundle.all_species.columns:
@@ -3218,10 +3407,41 @@ def save_all_figures(
             ]
         else:
             edna_df = pd.DataFrame()
-        edna_fig = plot_edna_unique_taxa_stacked(edna_df)
-        edna_path = _path("edna_unique_taxa_stacked")
-        edna_fig.savefig(edna_path, dpi=dpi, bbox_inches="tight")
-        plt.close(edna_fig)
-        saved["edna_unique_taxa_stacked"] = str(edna_path)
+        if edna_df.empty:
+            _skip(key, "no eDNA observation data")
+        else:
+            _save(key, plot_edna_unique_taxa_stacked(edna_df))
+
+    # Drop stale figures for sensors that are no longer selected / had no data.
+    sensor_figure_keys = {
+        "camera": (
+            "camera_sampling_locations",
+            "timeline_camera_trap_activity",
+            "species_per_class_camera",
+            "species_accumulation_mammal_bird_camera",
+            "top_mammal_bird_species_camera",
+        ),
+        "bioacoustic": (
+            "bioacoustic_sampling_locations",
+            "timeline_bioacoustic_activity",
+            "species_per_class_bioacoustic",
+            "species_accumulation_mammal_bird_bioacoustic",
+            "top_mammal_bird_species_bioacoustic",
+        ),
+        "edna": (
+            "edna_sampling_locations",
+            "edna_unique_taxa_stacked",
+        ),
+    }
+    for sensor, keys in sensor_figure_keys.items():
+        if sensor in selected:
+            continue
+        for key in keys:
+            if key in saved:
+                continue
+            path = _path(key)
+            if path.exists():
+                print(f"Warning: removing stale figure '{key}' (no {sensor} data).")
+                path.unlink()
 
     return saved

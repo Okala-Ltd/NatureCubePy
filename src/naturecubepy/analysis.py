@@ -158,6 +158,7 @@ def load_project_data(
                 empty_factory=_empty_observation_frame,
             )
 
+        stations_by_sensor: dict[str, pd.DataFrame] = {}
         station_frames: list[pd.DataFrame] = []
         for sensor, future in station_futures.items():
             frame = _fetch_source(
@@ -166,6 +167,7 @@ def load_project_data(
                 allow_missing_sources=allow_missing_sources,
                 empty_factory=_empty_stations_frame,
             )
+            stations_by_sensor[sensor] = frame
             if not frame.empty:
                 station_frames.append(frame)
 
@@ -188,6 +190,21 @@ def load_project_data(
                     stacklevel=2,
                 )
                 iucn_map = None
+
+    # Drop sensors with neither observations nor stations so downstream export
+    # skips empty figures / tables / CSV caches.
+    kept: list[str] = []
+    for sensor in selected:
+        obs = obs_data.get(sensor, _empty_observation_frame())
+        st = stations_by_sensor.get(sensor, _empty_stations_frame())
+        if (obs is not None and not obs.empty) or (st is not None and not st.empty):
+            kept.append(sensor)
+        else:
+            print(
+                f"Warning: no {sensor} data found; "
+                "skipping figures, tables, and caches for this sensor."
+            )
+    selected = tuple(kept)
 
     camera = obs_data.get("camera", _empty_observation_frame())
     bioacoustic = obs_data.get("bioacoustic", _empty_observation_frame())
@@ -227,7 +244,11 @@ def load_project_data(
 
 
 def save_observation_bundle(bundle: ObservationBundle, data_dir: str | Path) -> dict[str, str]:
-    """Persist observation frames as CSV caches under ``data_dir``."""
+    """Persist observation frames as CSV caches under ``data_dir``.
+
+    Empty frames are skipped (with a terminal warning) and any stale CSV for
+    that name is removed so prior empty artefacts do not linger.
+    """
     out = Path(data_dir)
     out.mkdir(parents=True, exist_ok=True)
 
@@ -245,8 +266,22 @@ def save_observation_bundle(bundle: ObservationBundle, data_dir: str | Path) -> 
 
     for name, frame in frames.items():
         path = out / f"{name}.csv"
+        if frame is None or frame.empty:
+            print(f"Warning: no rows for {name}; not writing empty CSV cache.")
+            if path.exists():
+                path.unlink()
+            continue
         frame.to_csv(path, index=False)
         saved[name] = str(path)
+
+    # Remove stale sensor caches for sensors that were requested but had no data.
+    for sensor in ("camera", "bioacoustic", "edna"):
+        if sensor in frames:
+            continue
+        path = out / f"{sensor}.csv"
+        if path.exists():
+            print(f"Warning: removing stale empty/unused cache {path.name}.")
+            path.unlink()
     return saved
 
 # ---------------------------------------------------------------------------
@@ -453,28 +488,32 @@ def save_all_tables(
     out.mkdir(parents=True, exist_ok=True)
     prefix = f"{filename_prefix}_" if filename_prefix else ""
 
-    sensor_summary = station_summary_table(bundle.stations)
-    redlist = redlist_status_table(bundle.all_species)
-    major_concern = major_concern_species_table(bundle.all_species, top_n=major_concern_top_n)
-    species_class = species_per_class_table(bundle.camera, bundle.bioacoustic)
+    tables = {
+        "sensor_summary": (f"{prefix}sensor_summary.csv", station_summary_table(bundle.stations)),
+        "redlist_status": (f"{prefix}redlist_status_table.csv", redlist_status_table(bundle.all_species)),
+        "major_concern_species": (
+            f"{prefix}major_concern_species_table.csv",
+            major_concern_species_table(bundle.all_species, top_n=major_concern_top_n),
+        ),
+        "species_per_class": (
+            f"{prefix}species_per_class_table.csv",
+            species_per_class_table(
+                bundle.camera if "camera" in bundle.sensor_types else pd.DataFrame(),
+                bundle.bioacoustic if "bioacoustic" in bundle.sensor_types else pd.DataFrame(),
+            ),
+        ),
+    }
 
     saved: dict[str, str] = {}
-
-    sensor_path = out / f"{prefix}sensor_summary.csv"
-    sensor_summary.to_csv(sensor_path, index=False)
-    saved["sensor_summary"] = str(sensor_path)
-
-    redlist_path = out / f"{prefix}redlist_status_table.csv"
-    redlist.to_csv(redlist_path, index=False)
-    saved["redlist_status"] = str(redlist_path)
-
-    concern_path = out / f"{prefix}major_concern_species_table.csv"
-    major_concern.to_csv(concern_path, index=False)
-    saved["major_concern_species"] = str(concern_path)
-
-    class_path = out / f"{prefix}species_per_class_table.csv"
-    species_class.to_csv(class_path, index=False)
-    saved["species_per_class"] = str(class_path)
+    for key, (filename, table) in tables.items():
+        path = out / filename
+        if table is None or table.empty:
+            print(f"Warning: no rows for table '{key}'; not writing empty CSV.")
+            if path.exists():
+                path.unlink()
+            continue
+        table.to_csv(path, index=False)
+        saved[key] = str(path)
 
     return saved
 

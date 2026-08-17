@@ -232,14 +232,20 @@ class MediaRecordSimple(BaseModel):
 
 
 class MediaRecordAPIFlat(MediaRecordSimple, SegmentSimple, SpeciesLight):
-    """Flat media record with all details for API responses."""
+    """Flat media record with all details for API responses.
 
-    number_of_individuals: int
-    segment_record_id: int
-    label_record_id: int
-    prediction_accuracy: float
-    manager_verified: bool
-    labeller_verified: bool
+    Label fields are nullable because unlabelled and blank segments are
+    returned with no label attached.
+    """
+
+    label_id: int | None = None
+    label: str | None = None
+    number_of_individuals: int | None = None
+    segment_record_id: int | None = None
+    label_record_id: int | None = None
+    prediction_accuracy: float | None = None
+    manager_verified: bool | None = None
+    labeller_verified: bool | None = None
     blank: bool | None = False
     segment_verification_status: SegmentVerificationStatuses = "ai_derived"
 
@@ -259,10 +265,10 @@ class MediaRecordAPIFlat(MediaRecordSimple, SegmentSimple, SpeciesLight):
 class SegmentRecordAPIFlat(MediaRecordSimple, SegmentSimple):
     """Flat segment record for API responses."""
 
-    segment_record_id: int
-    prediction_accuracy: float
-    manager_verified: bool
-    labeller_verified: bool
+    segment_record_id: int | None = None
+    prediction_accuracy: float | None = None
+    manager_verified: bool | None = None
+    labeller_verified: bool | None = None
     blank: bool | None = False
     segment_verification_status: SegmentVerificationStatuses = "ai_derived"
 

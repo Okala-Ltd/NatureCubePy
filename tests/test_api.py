@@ -257,11 +257,12 @@ class TestGetStationInfo:
         with patch("naturecubepy.api.httpx.get", side_effect=[image_response, video_response]) as mock_get:
             result = get_station_info(hdr, "camera")
 
-        import geopandas as gpd
-
-        assert isinstance(result, gpd.GeoDataFrame)
+        assert isinstance(result, pd.DataFrame)
         assert len(result) == 2
         assert set(result["data_type"]) == {"image", "video"}
+        assert "geometry" not in result.columns
+        assert result["latitude"].tolist() == [53.4, 53.5]
+        assert result["longitude"].tolist() == [-1.5, -1.6]
         assert mock_get.call_count == 2
 
     def test_paginates_stations_for_single_datatype(self, hdr):

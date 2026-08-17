@@ -10,7 +10,10 @@ eDNA records, and timestamps.
 import collections
 import math
 import os
+import shutil
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Literal
 from urllib.parse import urlsplit, urlunsplit
 from collections.abc import Iterator
@@ -285,7 +288,7 @@ def fetch_station_features(hdr: AuthHeaders, datatype: str) -> gpd.GeoDataFrame:
     return gpd.GeoDataFrame.from_features(all_features) if all_features else gpd.GeoDataFrame()
 
 
-def get_station_info(hdr: AuthHeaders, measurement_type: str | None) -> gpd.GeoDataFrame:
+def get_station_info(hdr: AuthHeaders, measurement_type: str | None) -> pd.DataFrame:
     """Retrieve all station metadata for a project, optionally filtered by measurement type.
 
     Parameters
@@ -298,8 +301,9 @@ def get_station_info(hdr: AuthHeaders, measurement_type: str | None) -> gpd.GeoD
 
     Returns
     -------
-    geopandas.GeoDataFrame
-        A GeoDataFrame containing station metadata and geometry.
+    pandas.DataFrame
+        A flat table containing station metadata with ``latitude`` and
+        ``longitude`` columns instead of a geometry column.
 
     Raises
     ------
@@ -334,7 +338,15 @@ def get_station_info(hdr: AuthHeaders, measurement_type: str | None) -> gpd.GeoD
                 dfs.append(gdf[mask])
             else:
                 dfs.append(gdf)
-    return gpd.GeoDataFrame(pd.concat(dfs, ignore_index=True)) if dfs else gpd.GeoDataFrame()
+    if not dfs:
+        return pd.DataFrame()
+
+    stations = gpd.GeoDataFrame(pd.concat(dfs, ignore_index=True))
+    if "geometry" in stations.columns:
+        stations["latitude"] = stations.geometry.y
+        stations["longitude"] = stations.geometry.x
+        stations = pd.DataFrame(stations.drop(columns=["geometry"]))
+    return stations
 
 
 def get_stations_typed(hdr: AuthHeaders, datatype: DataTypes) -> StationResponseAPI:
@@ -369,6 +381,86 @@ def get_stations_typed(hdr: AuthHeaders, datatype: DataTypes) -> StationResponse
 MEDIA_PAGE_TIMEOUT = 180.0
 MEDIA_MAX_RETRIES = 6
 MEDIA_RETRY_BASE_SECONDS = 2.0
+# The API rate-limits aggressive concurrency (8 parallel page requests return
+# HTTP 429), and per-request latency climbs as workers are added, so throughput
+# peaks at a handful of workers.
+MEDIA_MAX_WORKERS = 3
+
+
+def _format_duration(seconds: float) -> str:
+    """Format a rough ETA as ``45s``, ``12m``, or ``1h04m``."""
+    seconds = max(int(seconds), 0)
+    if seconds < 60:
+        return f"{seconds}s"
+    minutes, secs = divmod(seconds, 60)
+    if minutes < 60:
+        return f"{minutes}m{secs:02d}s"
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours}h{minutes:02d}m"
+
+
+class _ProgressBar:
+    """Single-line progress bar for long downloads, safe to advance from threads."""
+
+    def __init__(self, label: str, total: int, *, unit: str = "", width: int = 30) -> None:
+        self.label = label
+        self.total = max(int(total), 1)
+        self.unit = unit
+        self.width = width
+        self.done = 0
+        self._lock = threading.Lock()
+        self._closed = False
+        self._start = time.monotonic()
+        self._draw()
+
+    def advance(self, step: int = 1) -> None:
+        with self._lock:
+            self.done = min(self.done + step, self.total)
+            self._draw()
+
+    def notice(self, message: str) -> None:
+        """Report a stall (retry, rate limit) without corrupting the bar line."""
+        with self._lock:
+            print(f"\r\x1b[2K{message}", flush=True)
+            self._draw()
+
+    def close(self) -> None:
+        with self._lock:
+            if not self._closed:
+                self._closed = True
+                print(flush=True)
+
+    def _draw(self) -> None:
+        pct = 100 * self.done / self.total
+        unit = f" {self.unit}" if self.unit else ""
+        prefix = f"{self.label} "
+        suffix = f" {self.done}/{self.total}{unit} ({pct:3.0f}%)"
+
+        elapsed = time.monotonic() - self._start
+        if self.done and self.done < self.total and elapsed > 1:
+            remaining = (self.total - self.done) * elapsed / self.done
+            suffix += f" ETA {_format_duration(remaining)}"
+
+        # Keep the whole line inside the terminal width: a line that wraps makes
+        # the carriage return redraw on the wrapped fragment instead of the bar.
+        columns = shutil.get_terminal_size(fallback=(80, 24)).columns
+        budget = columns - 1 - len(prefix) - len(suffix) - 2  # 2 for the |bars|
+        bar_width = max(min(self.width, budget), 4)
+        filled = round(bar_width * self.done / self.total)
+        line = f"{prefix}|{'#' * filled}{'.' * (bar_width - filled)}|{suffix}"
+
+        # \x1b[2K clears the row so a shorter line cannot leave stale characters.
+        print(f"\r\x1b[2K{line[: columns - 1]}", end="", flush=True)
+
+
+def _page_kind(fetch_page: Callable[..., Any]) -> str:
+    """Name the record type a page fetcher returns, for progress messages."""
+    name = getattr(fetch_page, "__name__", "")
+    if "segments" in name:
+        return "segments"
+    if "assets" in name:
+        return "media assets"
+    return "records"
 
 
 def _retry_after_seconds(response: httpx.Response, attempt: int) -> float:
@@ -389,6 +481,7 @@ def _post_media_page(
     limit: int,
     offset: int,
     timeout: float = MEDIA_PAGE_TIMEOUT,
+    on_retry: Callable[[str], None] | None = None,
 ) -> httpx.Response:
     """POST a media page with retries for HTTP 429 rate limits."""
     params = {"limit": min(limit, 1000), "offset": offset}
@@ -396,7 +489,13 @@ def _post_media_page(
     for attempt in range(MEDIA_MAX_RETRIES + 1):
         response = httpx.post(url, json=psr_ids, params=params, timeout=timeout)
         if response.status_code == 429 and attempt < MEDIA_MAX_RETRIES:
-            time.sleep(_retry_after_seconds(response, attempt))
+            wait = _retry_after_seconds(response, attempt)
+            if on_retry is not None:
+                on_retry(
+                    f"Rate limited by the API; waiting {wait:.0f}s "
+                    f"(retry {attempt + 1}/{MEDIA_MAX_RETRIES})"
+                )
+            time.sleep(wait)
             continue
         response.raise_for_status()
         return response
@@ -416,12 +515,14 @@ def fetch_media_assets_page(
     *,
     limit: int = 1000,
     offset: int = 0,
+    on_retry: Callable[[str], None] | None = None,
 ) -> tuple[list[MediaRecordAPIFlat], int | None]:
     response = _post_media_page(
         f"{hdr.root}getMediaAssets/{datatype}/{hdr.key}",
         psr_ids=psr_ids,
         limit=limit,
         offset=offset,
+        on_retry=on_retry,
     )
     payload = response.json()
     return [MediaRecordAPIFlat.model_validate(row) for row in extract_rows_from_payload(payload)], extract_total_count(payload)
@@ -434,12 +535,14 @@ def fetch_media_segments_page(
     *,
     limit: int = 1000,
     offset: int = 0,
+    on_retry: Callable[[str], None] | None = None,
 ) -> tuple[list[SegmentRecordAPIFlat], int | None]:
     response = _post_media_page(
         f"{hdr.root}getMediaSegments/{datatype}/{hdr.key}",
         psr_ids=psr_ids,
         limit=limit,
         offset=offset,
+        on_retry=on_retry,
     )
     payload = response.json()
     return [SegmentRecordAPIFlat.model_validate(row) for row in extract_rows_from_payload(payload)], extract_total_count(payload)
@@ -458,7 +561,11 @@ def _iter_pages(
     *,
     page_size: int,
     chunk_size: int,
+    bar: _ProgressBar | None = None,
+    on_rows: Callable[[int], None] | None = None,
 ) -> Iterator[T]:
+    notify = bar.notice if bar is not None else None
+
     for chunk_start in range(0, len(psr_ids), chunk_size):
         chunk = psr_ids[chunk_start : chunk_start + chunk_size]
         offset = 0
@@ -466,16 +573,25 @@ def _iter_pages(
 
         while True:
             try:
-                rows, page_total = fetch_page(hdr, datatype, chunk, limit=page_size, offset=offset)
+                rows, page_total = fetch_page(
+                    hdr, datatype, chunk, limit=page_size, offset=offset, on_retry=notify
+                )
             except httpx.TimeoutException:
                 if len(chunk) <= 1:
                     # Single-station timeouts: brief retry before failing hard.
                     retried = False
                     for attempt in range(2):
-                        time.sleep(MEDIA_RETRY_BASE_SECONDS * (2 ** attempt))
+                        wait = MEDIA_RETRY_BASE_SECONDS * (2 ** attempt)
+                        if bar is not None:
+                            bar.notice(
+                                f"PSR {chunk[0]} timed out; retrying in {wait:.0f}s "
+                                f"({attempt + 1}/2)"
+                            )
+                        time.sleep(wait)
                         try:
                             rows, page_total = fetch_page(
-                                hdr, datatype, chunk, limit=page_size, offset=offset
+                                hdr, datatype, chunk, limit=page_size, offset=offset,
+                                on_retry=notify,
                             )
                             retried = True
                             break
@@ -486,9 +602,11 @@ def _iter_pages(
                 else:
                     mid = max(1, len(chunk) // 2)
                     yield from _iter_pages(fetch_page, hdr, datatype, chunk[:mid],
-                                           page_size=page_size, chunk_size=chunk_size)
+                                           page_size=page_size, chunk_size=chunk_size,
+                                           bar=bar, on_rows=on_rows)
                     yield from _iter_pages(fetch_page, hdr, datatype, chunk[mid:],
-                                           page_size=page_size, chunk_size=chunk_size)
+                                           page_size=page_size, chunk_size=chunk_size,
+                                           bar=bar, on_rows=on_rows)
                     break
 
             if page_total is not None:
@@ -499,12 +617,91 @@ def _iter_pages(
 
             yield from rows
             offset += len(rows)
+            if on_rows is not None:
+                on_rows(len(rows))
 
             if total is not None:
                 if offset >= total:
                     break
             elif len(rows) < page_size:
                 break
+
+
+def _iter_pages_parallel(
+    fetch_page: Callable[..., tuple[list[T], int | None]],
+    hdr: AuthHeaders,
+    datatype: DataTypes,
+    psr_ids: list[int],
+    *,
+    page_size: int,
+    chunk_size: int,
+    max_workers: int,
+    total_rows: int | None = None,
+) -> Iterator[T]:
+    """Fetch chunks concurrently across stations, preserving input order.
+
+    Each chunk is paginated sequentially (offsets depend on prior pages) by
+    reusing :func:`_iter_pages`, but independent chunks run in parallel threads.
+    Since the page fetches are network-bound HTTP calls, this gives a large
+    speed-up over fetching one station at a time.
+
+    When ``total_rows`` is known (from station record counts) the progress bar
+    counts rows, which moves every page instead of only when a whole station
+    finishes.
+    """
+    chunks = [
+        psr_ids[start : start + chunk_size]
+        for start in range(0, len(psr_ids), chunk_size)
+    ]
+    workers = 1 if max_workers <= 1 or len(chunks) <= 1 else min(max_workers, len(chunks))
+    label = f"{datatype} {_page_kind(fetch_page)}"
+
+    row_mode = bool(total_rows and total_rows > 0)
+    if row_mode:
+        bar = _ProgressBar(label, int(total_rows), unit="rows")
+    elif len(chunks) > 1:
+        # Single-station calls (e.g. camera trap's per-station loop) skip the bar
+        # so an outer progress bar can own the display.
+        bar = _ProgressBar(label, len(chunks), unit="stations")
+    else:
+        bar = None
+    on_rows = bar.advance if (bar is not None and row_mode) else None
+
+    def chunk_done() -> None:
+        if bar is not None and not row_mode:
+            bar.advance()
+
+    try:
+        if workers == 1:
+            for chunk in chunks:
+                yield from _iter_pages(
+                    fetch_page, hdr, datatype, chunk,
+                    page_size=page_size, chunk_size=chunk_size,
+                    bar=bar, on_rows=on_rows,
+                )
+                chunk_done()
+            return
+
+        def collect(chunk: list[int]) -> list[T]:
+            return list(
+                _iter_pages(
+                    fetch_page, hdr, datatype, chunk,
+                    page_size=page_size, chunk_size=chunk_size,
+                    bar=bar, on_rows=on_rows,
+                )
+            )
+
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = [executor.submit(collect, chunk) for chunk in chunks]
+            # Advance on completion so the bar tracks real progress, but yield in
+            # submission order so rows stay ordered by station.
+            for future in futures:
+                future.add_done_callback(lambda _f: chunk_done())
+            for future in futures:
+                yield from future.result()
+    finally:
+        if bar is not None:
+            bar.close()
 
 # ---------------------------------------------------------------------------
 # Public iterators
@@ -517,10 +714,13 @@ def iter_media_assets(
     *,
     page_size: int = 1000,
     chunk_size: int = 1,
+    max_workers: int = MEDIA_MAX_WORKERS,
+    total_rows: int | None = None,
 ) -> Iterator[MediaRecordAPIFlat]:
-    yield from _iter_pages(
+    yield from _iter_pages_parallel(
         fetch_media_assets_page, hdr, datatype, normalise_psr_ids(psr_ids),
-        page_size=page_size, chunk_size=chunk_size,
+        page_size=page_size, chunk_size=chunk_size, max_workers=max_workers,
+        total_rows=total_rows,
     )
 
 
@@ -531,10 +731,13 @@ def iter_media_segments(
     *,
     page_size: int = 1000,
     chunk_size: int = 1,
+    max_workers: int = MEDIA_MAX_WORKERS,
+    total_rows: int | None = None,
 ) -> Iterator[SegmentRecordAPIFlat]:
-    yield from _iter_pages(
+    yield from _iter_pages_parallel(
         fetch_media_segments_page, hdr, datatype, normalise_psr_ids(psr_ids),
-        page_size=page_size, chunk_size=chunk_size,
+        page_size=page_size, chunk_size=chunk_size, max_workers=max_workers,
+        total_rows=total_rows,
     )
 
 # ---------------------------------------------------------------------------
@@ -548,8 +751,9 @@ def get_media_assets(
     *,
     page_size: int = 1000,
     chunk_size: int = 1,
+    max_workers: int = MEDIA_MAX_WORKERS,
 ) -> list[MediaRecordAPIFlat]:
-    return list(iter_media_assets(hdr, datatype, psr_ids, page_size=page_size, chunk_size=chunk_size))
+    return list(iter_media_assets(hdr, datatype, psr_ids, page_size=page_size, chunk_size=chunk_size, max_workers=max_workers))
 
 def get_media_segments(
     hdr: AuthHeaders,
@@ -558,8 +762,9 @@ def get_media_segments(
     *,
     page_size: int = 1000,
     chunk_size: int = 1,
+    max_workers: int = MEDIA_MAX_WORKERS,
 ) -> list[SegmentRecordAPIFlat]:
-    return list(iter_media_segments(hdr, datatype, psr_ids, page_size=page_size, chunk_size=chunk_size))
+    return list(iter_media_segments(hdr, datatype, psr_ids, page_size=page_size, chunk_size=chunk_size, max_workers=max_workers))
 
 def get_media_assets_df(
     hdr: AuthHeaders,
@@ -568,10 +773,12 @@ def get_media_assets_df(
     *,
     page_size: int = 1000,
     chunk_size: int = 1,
+    max_workers: int = MEDIA_MAX_WORKERS,
+    total_rows: int | None = None,
 ) -> pd.DataFrame:
     return pd.DataFrame(
         row.model_dump()
-        for row in iter_media_assets(hdr, datatype, psr_ids, page_size=page_size, chunk_size=chunk_size)
+        for row in iter_media_assets(hdr, datatype, psr_ids, page_size=page_size, chunk_size=chunk_size, max_workers=max_workers, total_rows=total_rows)
     )
 
 def get_media_segments_df(
@@ -581,10 +788,11 @@ def get_media_segments_df(
     *,
     page_size: int = 1000,
     chunk_size: int = 1,
+    max_workers: int = MEDIA_MAX_WORKERS,
 ) -> pd.DataFrame:
     return pd.DataFrame(
         row.model_dump()
-        for row in iter_media_segments(hdr, datatype, psr_ids, page_size=page_size, chunk_size=chunk_size)
+        for row in iter_media_segments(hdr, datatype, psr_ids, page_size=page_size, chunk_size=chunk_size, max_workers=max_workers)
     )
 
 # ---------------------------------------------------------------------------
@@ -606,7 +814,7 @@ def normalise_psr_ids(project_system_record_ids: int | list[int]) -> list[int]:
     return normalised
 
 
-def build_station_lookup(stations: gpd.GeoDataFrame, data_type: str) -> pd.DataFrame:
+def build_station_lookup(stations: pd.DataFrame, data_type: str) -> pd.DataFrame:
     """Build a flat station lookup table with location metadata."""
     if stations.empty:
         return pd.DataFrame(columns=STATION_LOOKUP_COLUMNS)
@@ -620,8 +828,14 @@ def build_station_lookup(stations: gpd.GeoDataFrame, data_type: str) -> pd.DataF
         return pd.DataFrame(columns=STATION_LOOKUP_COLUMNS)
 
     lookup["project_system_record_id"] = lookup["project_system_record_id"].astype(int)
-    lookup["latitude"] = lookup.geometry.y
-    lookup["longitude"] = lookup.geometry.x
+    if "geometry" in lookup.columns:
+        lookup["latitude"] = lookup.geometry.y
+        lookup["longitude"] = lookup.geometry.x
+    elif not {"latitude", "longitude"}.issubset(lookup.columns):
+        raise ValueError(
+            "Station data must contain either a geometry column or latitude "
+            "and longitude columns."
+        )
     if "data_type" not in lookup.columns:
         lookup["data_type"] = data_type
 
@@ -713,27 +927,37 @@ def fetch_and_merge_edna_assets(hdr: AuthHeaders, station_lookup: pd.DataFrame) 
     """Fetch eDNA assets for a station lookup and merge location metadata."""
     frames: list[pd.DataFrame] = []
     errors: list[str] = []
-    for psr_id in station_lookup["project_system_record_id"].tolist():
-        try:
-            assets = get_edna_assets(hdr, project_system_record_id=psr_id)
-        except httpx.HTTPStatusError as exc:
-            if exc.response.status_code in {404, 500}:
-                # The backend may return 500 for stations without eDNA rows.
-                # Treat these as no-data stations and continue.
+    psr_ids = station_lookup["project_system_record_id"].tolist()
+    bar = _ProgressBar("eDNA assets", len(psr_ids)) if len(psr_ids) > 1 else None
+    try:
+        for psr_id in psr_ids:
+            assets = pd.DataFrame()
+            try:
+                assets = get_edna_assets(hdr, project_system_record_id=psr_id)
+            except httpx.HTTPStatusError as exc:
+                if exc.response.status_code in {404, 500}:
+                    # The backend may return 500 for stations without eDNA rows.
+                    # Treat these as no-data stations and continue.
+                    continue
+                msg = (
+                    f"eDNA assets API returned HTTP {exc.response.status_code} for PSR {psr_id}. "
+                    "Species labels will be unavailable for this station."
+                )
+                errors.append(msg)
                 continue
-            msg = (
-                f"eDNA assets API returned HTTP {exc.response.status_code} for PSR {psr_id}. "
-                "Species labels will be unavailable for this station."
-            )
-            errors.append(msg)
-            continue
-        except Exception as exc:
-            errors.append(f"Failed to fetch eDNA assets for PSR {psr_id}: {exc}")
-            continue
-        if not assets.empty:
-            assets = assets.copy()
-            assets["project_system_record_id"] = psr_id
-            frames.append(assets)
+            except Exception as exc:
+                errors.append(f"Failed to fetch eDNA assets for PSR {psr_id}: {exc}")
+                continue
+            finally:
+                if bar is not None:
+                    bar.advance()
+            if not assets.empty:
+                assets = assets.copy()
+                assets["project_system_record_id"] = psr_id
+                frames.append(assets)
+    finally:
+        if bar is not None:
+            bar.close()
 
     if not frames:
         if errors:
@@ -771,14 +995,21 @@ def fetch_observations_for_datatype(
     if str(datatype).lower() == "edna":
         merged = fetch_and_merge_edna_assets(hdr, station_lookup)
     else:
+        # getMediaAssets already outer-joins labels and verification fields onto
+        # each segment row. A second getMediaSegments pass is unnecessary for
+        # observation tables (NatureCubeR uses assets only).
         psr_ids = station_lookup["project_system_record_id"].tolist()
-        media_df = get_media_assets_df(hdr, datatype, psr_ids)
+        # record_count is the exact number of segment rows per station, so it
+        # gives the progress bar a real total and ETA.
+        total_rows = None
+        if "record_count" in scoped_stations.columns:
+            counts = pd.to_numeric(scoped_stations["record_count"], errors="coerce").fillna(0)
+            total_rows = int(counts.sum()) or None
+        media_df = get_media_assets_df(hdr, datatype, psr_ids, total_rows=total_rows)
         if media_df.empty:
             return pd.DataFrame(), station_lookup
-        segments_df = get_media_segments(hdr, datatype, psr_ids)
         media_df = resolve_psr_id_column(media_df)
-        merged = merge_segments(media_df, segments_df)
-        merged = merge_station_lookup(merged, station_lookup)
+        merged = merge_station_lookup(media_df, station_lookup)
         if "data_type" not in merged.columns:
             merged["data_type"] = str(datatype)
     return merged, station_lookup
@@ -793,11 +1024,16 @@ def get_camera_trap_data(
     hdr: AuthHeaders,
     include_iucn_status: bool = False,
 ) -> pd.DataFrame:
-    """Retrieve merged camera trap media rows for all image and video stations.
+    """Retrieve camera trap species observations with station locations.
 
     Both image and video camera trap data are always returned together.
-    Stations are fetched one at a time so a rate-limit or timeout on a single
-    large deployment does not discard data already retrieved for other stations.
+    Stations are fetched in parallel (one station ID per request, a few workers)
+    using the same media downloader as audio observations.
+
+    Fetches media assets (which already include AI/human labels and
+    verification flags), joins station coordinates, and keeps only labelled,
+    non-blank detections. Image and video are fetched as separate passes so a
+    failure in one datatype does not discard the other.
 
     Parameters
     ----------
@@ -809,8 +1045,8 @@ def get_camera_trap_data(
     Returns
     -------
     pandas.DataFrame
-        A validated DataFrame containing merged camera trap media rows, with an
-        optional ``iucn_redlist_status`` column when ``include_iucn_status=True``.
+        One row per labelled camera detection, with station location columns and
+        verification fields such as ``segment_verification_status``.
 
     Examples
     --------
@@ -833,34 +1069,41 @@ def get_camera_trap_data(
         if station_lookup.empty:
             continue
 
-        for psr_id in station_lookup["project_system_record_id"].tolist():
-            try:
-                media_df = get_media_assets_df(hdr, datatype, [psr_id])
-                if media_df.empty:
-                    continue
-                segments_df = get_media_segments(hdr, datatype, [psr_id])
-                media_df = resolve_psr_id_column(media_df)
-                merged = merge_segments(media_df, segments_df)
-                merged = merge_station_lookup(merged, station_lookup)
-                if "data_type" not in merged.columns:
-                    merged["data_type"] = datatype
-                if not merged.empty:
-                    frames.append(merged)
-            except Exception as exc:
-                errors.append(f"PSR {psr_id} ({datatype}): {exc}")
-            # Brief pause between stations to reduce API rate-limit pressure.
-            time.sleep(0.5)
+        psr_ids = station_lookup["project_system_record_id"].tolist()
+        total_rows = None
+        if "record_count" in scoped_stations.columns:
+            counts = pd.to_numeric(scoped_stations["record_count"], errors="coerce").fillna(0)
+            total_rows = int(counts.sum()) or None
+
+        try:
+            # Parallel single-station requests via get_media_assets_df; no inter-
+            # station sleep. getMediaAssets already outer-joins labels.
+            media_df = get_media_assets_df(hdr, datatype, psr_ids, total_rows=total_rows)
+            if media_df.empty:
+                continue
+            media_df = resolve_psr_id_column(media_df)
+            merged = merge_station_lookup(media_df, station_lookup)
+            if "data_type" not in merged.columns:
+                merged["data_type"] = datatype
+            if "label" in merged.columns:
+                merged = merged[merged["label"].notna()]
+            if "blank" in merged.columns:
+                merged = merged[merged["blank"] != True]  # noqa: E712
+            if not merged.empty:
+                frames.append(merged)
+        except Exception as exc:
+            errors.append(f"{datatype}: {exc}")
 
     if errors:
         print(
-            f"Warning: camera trap download had {len(errors)} station failure(s). "
+            f"Warning: camera trap download had {len(errors)} datatype failure(s). "
             f"First error: {errors[0]}"
         )
 
     if not frames:
         if errors:
             raise RuntimeError(
-                "Camera trap download failed for all stations. "
+                "Camera trap download failed for all datatypes. "
                 f"First error: {errors[0]}"
             )
         return pd.DataFrame(columns=STATION_LOOKUP_COLUMNS)
@@ -876,7 +1119,11 @@ def get_audio_observation_data(
     hdr: AuthHeaders,
     include_iucn_status: bool = False,
 ) -> pd.DataFrame:
-    """Retrieve merged bioacoustic (audio) species observation rows.
+    """Retrieve bioacoustic species observations with station locations.
+
+    Fetches audio media assets (which already include AI/human labels and
+    verification flags), joins station coordinates, and keeps only labelled,
+    non-blank detections.
 
     Parameters
     ----------
@@ -888,9 +1135,9 @@ def get_audio_observation_data(
     Returns
     -------
     pandas.DataFrame
-        A DataFrame with one row per labelled audio segment, joined to station
-        location metadata, with an optional ``iucn_redlist_status`` column
-        when ``include_iucn_status=True``.
+        One row per labelled audio detection, with station location columns and
+        verification fields such as ``segment_verification_status``
+        (``ai_derived``, ``labeller_verified``, or ``manager_verified``).
 
     Examples
     --------
@@ -905,6 +1152,16 @@ def get_audio_observation_data(
         return pd.DataFrame(columns=STATION_LOOKUP_COLUMNS)
     if merged.empty:
         return station_lookup.drop(columns=["latitude", "longitude"], errors="ignore")
+
+    # getMediaAssets outer-joins labels, so unlabelled segments arrive with null
+    # label columns. Blank segments are labelled but reviewer-marked as empty.
+    if "label" in merged.columns:
+        merged = merged[merged["label"].notna()]
+    if "blank" in merged.columns:
+        merged = merged[merged["blank"] != True]  # noqa: E712
+    if merged.empty:
+        return pd.DataFrame(columns=list(merged.columns))
+
     if include_iucn_status:
         merged = enrich_with_iucn_status(merged, build_iucn_map(hdr))
     return merged.reset_index(drop=True)
