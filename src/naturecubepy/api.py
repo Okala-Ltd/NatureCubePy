@@ -381,10 +381,31 @@ def get_stations_typed(hdr: AuthHeaders, datatype: DataTypes) -> StationResponse
 MEDIA_PAGE_TIMEOUT = 180.0
 MEDIA_MAX_RETRIES = 6
 MEDIA_RETRY_BASE_SECONDS = 2.0
+MEDIA_RATE_LIMIT_FALLBACK_SECONDS = 60.0
 # The API rate-limits aggressive concurrency (8 parallel page requests return
 # HTTP 429), and per-request latency climbs as workers are added, so throughput
 # peaks at a handful of workers.
 MEDIA_MAX_WORKERS = 3
+
+# Shared cooldown so parallel workers pause together after a 429 instead of
+# stampeding the same sliding window.
+_media_rate_limit_until = 0.0
+_media_rate_limit_lock = threading.Lock()
+
+
+def _wait_for_media_rate_limit() -> None:
+    with _media_rate_limit_lock:
+        delay = _media_rate_limit_until - time.monotonic()
+    if delay > 0:
+        time.sleep(delay)
+
+
+def _note_media_rate_limit(wait: float) -> None:
+    global _media_rate_limit_until
+    with _media_rate_limit_lock:
+        _media_rate_limit_until = max(
+            _media_rate_limit_until, time.monotonic() + max(wait, 0.0)
+        )
 
 
 def _format_duration(seconds: float) -> str:
@@ -471,7 +492,8 @@ def _retry_after_seconds(response: httpx.Response, attempt: int) -> float:
             return max(float(header), MEDIA_RETRY_BASE_SECONDS)
         except ValueError:
             pass
-    return MEDIA_RETRY_BASE_SECONDS * (2 ** attempt)
+    # No header: assume the API's 1-minute hit window, with mild backoff.
+    return MEDIA_RATE_LIMIT_FALLBACK_SECONDS * (1 + 0.5 * attempt)
 
 
 def _post_media_page(
@@ -486,15 +508,18 @@ def _post_media_page(
 ) -> httpx.Response:
     """POST a media page with retries for HTTP 429 rate limits."""
     params: dict[str, int] = {"limit": min(limit, 1000)}
+    # Prefer keyset pagination when available: constant-time pages vs deep OFFSET.
     if after_segment_record_id is not None:
         params["after_segment_record_id"] = int(after_segment_record_id)
     else:
         params["offset"] = offset
 
     for attempt in range(MEDIA_MAX_RETRIES + 1):
+        _wait_for_media_rate_limit()
         response = httpx.post(url, json=psr_ids, params=params, timeout=timeout)
         if response.status_code == 429 and attempt < MEDIA_MAX_RETRIES:
             wait = _retry_after_seconds(response, attempt)
+            _note_media_rate_limit(wait)
             if on_retry is not None:
                 on_retry(
                     f"Rate limited by the API; waiting {wait:.0f}s "
@@ -569,6 +594,7 @@ def _row_segment_record_id(row: Any) -> int | None:
         value = row.get("segment_record_id")
     else:
         value = getattr(row, "segment_record_id", None)
+    # Accept real ints only (reject MagicMock / other sentinels used in tests).
     if isinstance(value, bool) or not isinstance(value, int):
         return None
     return int(value)
@@ -592,19 +618,16 @@ def _iter_pages(
         after_segment_record_id: int | None = None
         offset = 0
         use_keyset = True
-        total: int | None = None
 
         while True:
             try:
-                rows, page_total = fetch_page(
+                rows, _page_total = fetch_page(
                     hdr,
                     datatype,
                     chunk,
                     limit=page_size,
                     offset=offset,
-                    after_segment_record_id=(
-                        after_segment_record_id if use_keyset else None
-                    ),
+                    after_segment_record_id=after_segment_record_id if use_keyset else None,
                     on_retry=notify,
                 )
             except httpx.TimeoutException:
@@ -620,7 +643,7 @@ def _iter_pages(
                             )
                         time.sleep(wait)
                         try:
-                            rows, page_total = fetch_page(
+                            rows, _page_total = fetch_page(
                                 hdr,
                                 datatype,
                                 chunk,
@@ -647,9 +670,6 @@ def _iter_pages(
                                            bar=bar, on_rows=on_rows)
                     break
 
-            if page_total is not None:
-                total = page_total
-
             if not rows:
                 break
 
@@ -665,17 +685,16 @@ def _iter_pages(
             if use_keyset and segment_ids:
                 unique_segments = len(set(segment_ids))
                 after_segment_record_id = max(segment_ids)
+                # Backend pages by unique segment IDs; stop once a short ID page returns.
                 if unique_segments < page_size:
                     break
                 continue
 
+            # Legacy OFFSET fallback when rows lack segment_record_id (or older API).
             use_keyset = False
             after_segment_record_id = None
             offset += len(rows)
-            if total is not None:
-                if offset >= total:
-                    break
-            elif len(rows) < page_size:
+            if len(rows) < page_size:
                 break
 
 
