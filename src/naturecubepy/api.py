@@ -479,12 +479,17 @@ def _post_media_page(
     *,
     psr_ids: list[int],
     limit: int,
-    offset: int,
+    offset: int = 0,
+    after_segment_record_id: int | None = None,
     timeout: float = MEDIA_PAGE_TIMEOUT,
     on_retry: Callable[[str], None] | None = None,
 ) -> httpx.Response:
     """POST a media page with retries for HTTP 429 rate limits."""
-    params = {"limit": min(limit, 1000), "offset": offset}
+    params: dict[str, int] = {"limit": min(limit, 1000)}
+    if after_segment_record_id is not None:
+        params["after_segment_record_id"] = int(after_segment_record_id)
+    else:
+        params["offset"] = offset
 
     for attempt in range(MEDIA_MAX_RETRIES + 1):
         response = httpx.post(url, json=psr_ids, params=params, timeout=timeout)
@@ -515,6 +520,7 @@ def fetch_media_assets_page(
     *,
     limit: int = 1000,
     offset: int = 0,
+    after_segment_record_id: int | None = None,
     on_retry: Callable[[str], None] | None = None,
 ) -> tuple[list[MediaRecordAPIFlat], int | None]:
     response = _post_media_page(
@@ -522,6 +528,7 @@ def fetch_media_assets_page(
         psr_ids=psr_ids,
         limit=limit,
         offset=offset,
+        after_segment_record_id=after_segment_record_id,
         on_retry=on_retry,
     )
     payload = response.json()
@@ -535,6 +542,7 @@ def fetch_media_segments_page(
     *,
     limit: int = 1000,
     offset: int = 0,
+    after_segment_record_id: int | None = None,
     on_retry: Callable[[str], None] | None = None,
 ) -> tuple[list[SegmentRecordAPIFlat], int | None]:
     response = _post_media_page(
@@ -542,6 +550,7 @@ def fetch_media_segments_page(
         psr_ids=psr_ids,
         limit=limit,
         offset=offset,
+        after_segment_record_id=after_segment_record_id,
         on_retry=on_retry,
     )
     payload = response.json()
@@ -552,6 +561,18 @@ def fetch_media_segments_page(
 # ---------------------------------------------------------------------------
 
 T = TypeVar("T")
+
+
+def _row_segment_record_id(row: Any) -> int | None:
+    """Extract ``segment_record_id`` from a pydantic model or dict row."""
+    if isinstance(row, dict):
+        value = row.get("segment_record_id")
+    else:
+        value = getattr(row, "segment_record_id", None)
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return int(value)
+
 
 def _iter_pages(
     fetch_page: Callable[..., tuple[list[T], int | None]],
@@ -568,13 +589,23 @@ def _iter_pages(
 
     for chunk_start in range(0, len(psr_ids), chunk_size):
         chunk = psr_ids[chunk_start : chunk_start + chunk_size]
+        after_segment_record_id: int | None = None
         offset = 0
+        use_keyset = True
         total: int | None = None
 
         while True:
             try:
                 rows, page_total = fetch_page(
-                    hdr, datatype, chunk, limit=page_size, offset=offset, on_retry=notify
+                    hdr,
+                    datatype,
+                    chunk,
+                    limit=page_size,
+                    offset=offset,
+                    after_segment_record_id=(
+                        after_segment_record_id if use_keyset else None
+                    ),
+                    on_retry=notify,
                 )
             except httpx.TimeoutException:
                 if len(chunk) <= 1:
@@ -590,7 +621,14 @@ def _iter_pages(
                         time.sleep(wait)
                         try:
                             rows, page_total = fetch_page(
-                                hdr, datatype, chunk, limit=page_size, offset=offset,
+                                hdr,
+                                datatype,
+                                chunk,
+                                limit=page_size,
+                                offset=offset,
+                                after_segment_record_id=(
+                                    after_segment_record_id if use_keyset else None
+                                ),
                                 on_retry=notify,
                             )
                             retried = True
@@ -616,10 +654,24 @@ def _iter_pages(
                 break
 
             yield from rows
-            offset += len(rows)
             if on_rows is not None:
                 on_rows(len(rows))
 
+            segment_ids = [
+                seg_id
+                for seg_id in (_row_segment_record_id(row) for row in rows)
+                if seg_id is not None
+            ]
+            if use_keyset and segment_ids:
+                unique_segments = len(set(segment_ids))
+                after_segment_record_id = max(segment_ids)
+                if unique_segments < page_size:
+                    break
+                continue
+
+            use_keyset = False
+            after_segment_record_id = None
+            offset += len(rows)
             if total is not None:
                 if offset >= total:
                     break
@@ -1020,6 +1072,13 @@ def fetch_observations_for_datatype(
 # ---------------------------------------------------------------------------
 
 
+def _exclude_blank_segments(df: pd.DataFrame) -> pd.DataFrame:
+    """Drop reviewer-marked blank segments to match dashboard CSV exports."""
+    if "blank" not in df.columns or df.empty:
+        return df
+    return df[df["blank"] != True]  # noqa: E712
+
+
 def get_camera_trap_data(
     hdr: AuthHeaders,
     include_iucn_status: bool = False,
@@ -1031,9 +1090,11 @@ def get_camera_trap_data(
     using the same media downloader as audio observations.
 
     Fetches media assets (which already include AI/human labels and
-    verification flags), joins station coordinates, and keeps only labelled,
-    non-blank detections. Image and video are fetched as separate passes so a
-    failure in one datatype does not discard the other.
+    verification flags) and joins station coordinates. Matches the dashboard
+    CSV export: unlabelled segments are kept (null label columns) but
+    reviewer-marked blank segments (``blank=True``) are excluded. Image and
+    video are fetched as separate passes so a failure in one datatype does not
+    discard the other.
 
     Parameters
     ----------
@@ -1045,8 +1106,8 @@ def get_camera_trap_data(
     Returns
     -------
     pandas.DataFrame
-        One row per labelled camera detection, with station location columns and
-        verification fields such as ``segment_verification_status``.
+        One row per camera segment (labelled or not), with station location
+        columns and verification fields such as ``segment_verification_status``.
 
     Examples
     --------
@@ -1085,10 +1146,6 @@ def get_camera_trap_data(
             merged = merge_station_lookup(media_df, station_lookup)
             if "data_type" not in merged.columns:
                 merged["data_type"] = datatype
-            if "label" in merged.columns:
-                merged = merged[merged["label"].notna()]
-            if "blank" in merged.columns:
-                merged = merged[merged["blank"] != True]  # noqa: E712
             if not merged.empty:
                 frames.append(merged)
         except Exception as exc:
@@ -1109,6 +1166,7 @@ def get_camera_trap_data(
         return pd.DataFrame(columns=STATION_LOOKUP_COLUMNS)
 
     result = pd.concat(frames, ignore_index=True, sort=False)
+    result = _exclude_blank_segments(result)
     if include_iucn_status:
         result = enrich_with_iucn_status(result, build_iucn_map(hdr))
     return result
@@ -1122,8 +1180,9 @@ def get_audio_observation_data(
     """Retrieve bioacoustic species observations with station locations.
 
     Fetches audio media assets (which already include AI/human labels and
-    verification flags), joins station coordinates, and keeps only labelled,
-    non-blank detections.
+    verification flags) and joins station coordinates. Matches the dashboard
+    CSV export: unlabelled segments are kept (null label columns) but
+    reviewer-marked blank segments (``blank=True``) are excluded.
 
     Parameters
     ----------
@@ -1135,8 +1194,8 @@ def get_audio_observation_data(
     Returns
     -------
     pandas.DataFrame
-        One row per labelled audio detection, with station location columns and
-        verification fields such as ``segment_verification_status``
+        One row per audio segment (labelled or not), with station location
+        columns and verification fields such as ``segment_verification_status``
         (``ai_derived``, ``labeller_verified``, or ``manager_verified``).
 
     Examples
@@ -1153,12 +1212,9 @@ def get_audio_observation_data(
     if merged.empty:
         return station_lookup.drop(columns=["latitude", "longitude"], errors="ignore")
 
-    # getMediaAssets outer-joins labels, so unlabelled segments arrive with null
-    # label columns. Blank segments are labelled but reviewer-marked as empty.
-    if "label" in merged.columns:
-        merged = merged[merged["label"].notna()]
-    if "blank" in merged.columns:
-        merged = merged[merged["blank"] != True]  # noqa: E712
+    # getMediaAssets outer-joins labels: unlabelled segments keep null label
+    # columns. Dashboard exports exclude reviewer-marked blanks (blank=True).
+    merged = _exclude_blank_segments(merged)
     if merged.empty:
         return pd.DataFrame(columns=list(merged.columns))
 

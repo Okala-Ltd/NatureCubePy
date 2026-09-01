@@ -125,7 +125,7 @@ def test_get_camera_trap_data_keeps_partial_results_when_one_datatype_fails(hdr)
     assert result["data_type"].iloc[0] == "image"
 
 
-def test_get_camera_trap_data_drops_unlabelled_and_blank_rows(hdr):
+def test_get_camera_trap_data_keeps_unlabelled_excludes_blank_rows(hdr):
     stations = _station_frame(101, "image", 12.1, -0.1)
 
     labelled = _media_record(101, 1).model_dump(mode="json")
@@ -144,5 +144,7 @@ def test_get_camera_trap_data_drops_unlabelled_and_blank_rows(hdr):
     ):
         result = get_camera_trap_data(hdr)
 
-    assert len(result) == 1
-    assert result["label"].iloc[0] == "label-1"
+    # Match dashboard CSV: unlabelled yes, blank segments no.
+    assert len(result) == 2
+    assert result["label"].isna().sum() == 1
+    assert not bool(result["blank"].any())
