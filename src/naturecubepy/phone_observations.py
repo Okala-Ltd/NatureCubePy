@@ -1134,7 +1134,7 @@ def _dataframe_from_phone_export_response(
         with ZipFile(io.BytesIO(zip_response.content)) as zf:
             try:
                 with zf.open("observations.csv") as handle:
-                    frame = pd.read_csv(handle)
+                    frame = pd.read_csv(handle, encoding="utf-8")
             except KeyError as exc:
                 raise RuntimeError(
                     "Media export ZIP did not contain observations.csv."
@@ -1147,7 +1147,7 @@ def _dataframe_from_phone_export_response(
                     target = media_dir / Path(name).name
                     with zf.open(name) as src, target.open("wb") as dst:
                         dst.write(src.read())
-        return frame
+        return _repair_phone_export_text(frame)
 
     # Non-media exports stream text/csv (sometimes with charset).
     raw = response.content
@@ -1156,11 +1156,38 @@ def _dataframe_from_phone_export_response(
     if isinstance(raw, bytes):
         if not raw.strip():
             return pd.DataFrame()
-        return pd.read_csv(io.BytesIO(raw))
+        return _repair_phone_export_text(pd.read_csv(io.BytesIO(raw), encoding="utf-8"))
     text = str(raw).lstrip()
     if not text:
         return pd.DataFrame()
-    return pd.read_csv(io.StringIO(text))
+    return _repair_phone_export_text(pd.read_csv(io.StringIO(text), encoding="utf-8"))
+
+
+def _fix_text_encoding(value: Any) -> Any:
+    """Repair UTF-8 text that was mis-decoded as MacRoman (e.g. ``√©`` → ``é``)."""
+    if not isinstance(value, str) or not value:
+        return value
+    if "√" not in value and "Ã" not in value and "Â" not in value:
+        return value
+    for source_encoding in ("mac_roman", "latin-1", "cp1252"):
+        try:
+            fixed = value.encode(source_encoding).decode("utf-8")
+        except (UnicodeEncodeError, UnicodeDecodeError):
+            continue
+        if fixed != value and "√" not in fixed:
+            return fixed
+    return value
+
+
+def _repair_phone_export_text(frame: pd.DataFrame) -> pd.DataFrame:
+    """Force-clean object columns that show classic UTF-8/MacRoman mojibake."""
+    if frame.empty:
+        return frame
+    work = frame.copy()
+    for col in work.columns:
+        if work[col].dtype == object:
+            work[col] = work[col].map(_fix_text_encoding)
+    return work
 
 
 def _header_int(response: httpx.Response, *names: str) -> int | None:
@@ -1357,6 +1384,7 @@ def get_phone_observation_data(
     timeout: float = _PHONE_PAGE_TIMEOUT,
     media_dir: str | Path | None = None,
     wide: bool = False,
+    include_iucn: bool = True,
 ) -> pd.DataFrame:
     """Download phone observations for a project procedure as a DataFrame.
 
@@ -1387,6 +1415,10 @@ def get_phone_observation_data(
     wide:
         If ``True``, pivot to one row per feature with ``item_name`` values as
         column headers (see :func:`phone_observations_to_wide`).
+    include_iucn:
+        When ``wide=True``, also attach IUCN fields from the taxonomic ``labels``
+        payload (``common_name``, ``class``, ``order``, ``family``, ``genus``,
+        ``species``, etc.). Ignored for long format.
 
     Returns
     -------
@@ -1441,7 +1473,8 @@ def get_phone_observation_data(
     result = pd.concat(frames, ignore_index=True, sort=False)
     if "observation_id" in result.columns:
         result = result.drop_duplicates(subset=["observation_id"], keep="first")
-    result = _normalise_taxonomic_label_values(result.reset_index(drop=True))
+    result = _repair_phone_export_text(result.reset_index(drop=True))
+    result = _normalise_taxonomic_label_values(result)
     n_features = (
         result["feature_uuid"].nunique(dropna=True)
         if "feature_uuid" in result.columns
@@ -1450,7 +1483,7 @@ def get_phone_observation_data(
     if n_features is not None:
         print(f"Combined: {len(result)} observation rows across {n_features} feature(s)")
     if wide:
-        return phone_observations_to_wide(result)
+        return phone_observations_to_wide(result, include_iucn=include_iucn)
     return result
 
 
@@ -1469,6 +1502,20 @@ _FEATURE_WIDE_INDEX_COLS = (
     "username",
     "phone_model",
     "phone_operating_system",
+)
+
+#: IUCN / taxonomy fields pulled from the export ``labels`` JSON into wide columns.
+#: ``(json_key, wide_column_name)``.
+_IUCN_WIDE_FIELDS: tuple[tuple[str, str], ...] = (
+    ("common_name", "common_name"),
+    ("class_", "class"),
+    ("order", "order"),
+    ("family", "family"),
+    ("genus", "genus"),
+    ("species", "species"),
+    ("iucn_redlist_status", "iucn_redlist_status"),
+    ("number_of_individuals", "number_of_individuals"),
+    ("prediction_accuracy", "prediction_accuracy"),
 )
 
 
@@ -1535,17 +1582,77 @@ def extract_taxonomic_label(value: Any) -> str:
                 inner = None
             if inner is not None:
                 return extract_taxonomic_label(inner)
-        return "" if text.lower() in {"nan", "none", "null"} else text
+        text = _fix_text_encoding(text)
+        return "" if str(text).lower() in {"nan", "none", "null"} else str(text)
 
     names: list[str] = []
     for item in labels:
         name = item.get("label") or item.get("species") or item.get("common_name")
         if name is None:
             continue
-        text = str(name).strip()
+        text = _fix_text_encoding(str(name).strip())
         if text:
-            names.append(text)
+            names.append(str(text))
     return ", ".join(names)
+
+
+def extract_iucn_fields(value: Any) -> dict[str, str]:
+    """Extract IUCN taxonomy fields from a phone-observation labels payload.
+
+    Returns a dict keyed by wide-column names (``common_name``, ``class``,
+    ``order``, ``family``, ``genus``, ``species``, …). Multiple label entries
+    for the same field are joined with ``", "``.
+    """
+    labels = _parse_labels_payload(value)
+    if not labels:
+        return {}
+
+    collected: dict[str, list[str]] = {col: [] for _, col in _IUCN_WIDE_FIELDS}
+    for item in labels:
+        for json_key, col in _IUCN_WIDE_FIELDS:
+            raw = item.get(json_key)
+            if raw is None:
+                continue
+            text = _fix_text_encoding(str(raw).strip())
+            if text and str(text).lower() not in {"nan", "none", "null"}:
+                collected[col].append(str(text))
+
+    return {col: ", ".join(vals) for col, vals in collected.items() if vals}
+
+
+def _iucn_frame_from_long(df: pd.DataFrame) -> pd.DataFrame:
+    """Build one IUCN-attribute row per ``feature_uuid`` from long-format labels."""
+    if df.empty or "feature_uuid" not in df.columns:
+        return pd.DataFrame(columns=["feature_uuid"])
+
+    work = df
+    if "data_type" in work.columns:
+        label_rows = work[
+            work["data_type"].astype(str).str.strip().str.lower().eq("label")
+        ]
+    else:
+        label_rows = work
+    if label_rows.empty and "labels" in work.columns:
+        label_rows = work
+    if label_rows.empty:
+        return pd.DataFrame(columns=["feature_uuid"])
+
+    rows: list[dict[str, Any]] = []
+    for feature_uuid, chunk in label_rows.groupby("feature_uuid", sort=False):
+        merged: dict[str, list[str]] = {col: [] for _, col in _IUCN_WIDE_FIELDS}
+        for _, row in chunk.iterrows():
+            for candidate in (row.get("labels"), row.get("data")):
+                fields = extract_iucn_fields(candidate)
+                if fields:
+                    for col, value in fields.items():
+                        if value and value not in merged[col]:
+                            merged[col].append(value)
+                    break
+        out: dict[str, Any] = {"feature_uuid": feature_uuid}
+        for _, col in _IUCN_WIDE_FIELDS:
+            out[col] = ", ".join(merged[col]) if merged[col] else pd.NA
+        rows.append(out)
+    return pd.DataFrame(rows)
 
 
 def _normalise_taxonomic_label_values(df: pd.DataFrame) -> pd.DataFrame:
@@ -1562,6 +1669,10 @@ def _normalise_taxonomic_label_values(df: pd.DataFrame) -> pd.DataFrame:
     looks_like_json = work["data"].map(lambda v: _parse_labels_payload(v) is not None)
     mask = is_label_type | looks_like_json
     if not bool(mask.any()):
+        # Still repair mojibake on remaining text cells.
+        work["data"] = work["data"].map(
+            lambda v: _fix_text_encoding(v) if isinstance(v, str) else v
+        )
         return work
 
     def _replace(row: pd.Series) -> Any:
@@ -1570,9 +1681,17 @@ def _normalise_taxonomic_label_values(df: pd.DataFrame) -> pd.DataFrame:
             if extracted:
                 return extracted
         raw = row.get("data")
+        if isinstance(raw, str):
+            return _fix_text_encoding(raw)
         return pd.NA if pd.isna(raw) else ""
 
     work.loc[mask, "data"] = work.loc[mask].apply(_replace, axis=1)
+    # Repair accents on non-label text/choice cells too.
+    other = ~mask
+    if bool(other.any()):
+        work.loc[other, "data"] = work.loc[other, "data"].map(
+            lambda v: _fix_text_encoding(v) if isinstance(v, str) else v
+        )
     return work
 
 
@@ -1588,10 +1707,10 @@ def _format_wide_cell_value(value: Any) -> str:
     if isinstance(value, (list, tuple)):
         parts = [_format_wide_cell_value(v) for v in value]
         return ", ".join(p for p in parts if p.strip())
-    text = str(value).strip()
-    if not text or text.lower() in {"nan", "none", "null"}:
+    text = _fix_text_encoding(str(value).strip())
+    if not text or str(text).lower() in {"nan", "none", "null"}:
         return ""
-    return text
+    return str(text)
 
 
 def _first_non_null(series: pd.Series) -> Any:
@@ -1606,7 +1725,7 @@ def _first_non_null(series: pd.Series) -> Any:
             pass
         if isinstance(value, str) and not value.strip():
             continue
-        return value
+        return _fix_text_encoding(value) if isinstance(value, str) else value
     return pd.NA
 
 
@@ -1616,6 +1735,7 @@ def phone_observations_to_wide(
     index_cols: list[str] | None = None,
     item_col: str = "item_name",
     value_col: str = "data",
+    include_iucn: bool = True,
 ) -> pd.DataFrame:
     """Pivot long phone-observation rows to one row per feature.
 
@@ -1623,6 +1743,10 @@ def phone_observations_to_wide(
     matching the dashboard CSV ``pivoted=True`` export. Multiple values for the
     same feature/item are joined with ``", "``. Taxonomic ``label`` rows have
     their JSON ``labels`` payload reduced to the species ``label`` text.
+
+    When ``include_iucn=True``, IUCN fields already present in the export
+    ``labels`` JSON (``common_name``, ``class``, ``order``, ``family``,
+    ``genus``, ``species``, …) are attached as extra columns.
 
     Parameters
     ----------
@@ -1637,6 +1761,8 @@ def phone_observations_to_wide(
     value_col:
         Column holding field values (default ``data``). Falls back to
         ``labels`` when ``data`` is null.
+    include_iucn:
+        Attach IUCN taxonomy columns from the ``labels`` payload.
 
     Returns
     -------
@@ -1650,6 +1776,8 @@ def phone_observations_to_wide(
     if "feature_uuid" not in df.columns:
         raise ValueError("Cannot pivot: expected a 'feature_uuid' column.")
 
+    # Keep original labels JSON for IUCN expansion before normalising data.
+    source_for_iucn = df
     work = _normalise_taxonomic_label_values(df)
     if value_col not in work.columns:
         if "labels" in work.columns:
@@ -1705,6 +1833,24 @@ def phone_observations_to_wide(
     feature_order = work["feature_uuid"].drop_duplicates().tolist()
     meta = meta.set_index("feature_uuid").reindex(feature_order).reset_index()
     wide = meta.merge(pivoted, on="feature_uuid", how="left")
+
+    if include_iucn:
+        iucn = _iucn_frame_from_long(source_for_iucn)
+        if not iucn.empty:
+            # Don't overwrite form item columns that share a name.
+            extra = [
+                c for c in iucn.columns if c == "feature_uuid" or c not in wide.columns
+            ]
+            iucn = iucn[extra]
+            # Omit fields the payload never populates (e.g. redlist until API adds it).
+            keep = ["feature_uuid"] + [
+                c
+                for c in iucn.columns
+                if c != "feature_uuid" and bool(iucn[c].notna().any())
+            ]
+            if len(keep) > 1:
+                wide = wide.merge(iucn[keep], on="feature_uuid", how="left")
+
     item_cols = [c for c in wide.columns if c not in meta_cols]
     print(
         f"Wide: {len(wide)} feature row(s), {len(item_cols)} item column(s)"

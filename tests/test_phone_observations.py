@@ -665,6 +665,10 @@ class TestGetPhoneObservationData:
                                 "label_id": 1,
                                 "label": "Panthera leo",
                                 "common_name": "Lion",
+                                "class_": "Mammalia",
+                                "order": "Carnivora",
+                                "family": "Felidae",
+                                "genus": "Panthera",
                                 "species": "Panthera leo",
                             }
                         ]
@@ -675,6 +679,11 @@ class TestGetPhoneObservationData:
                                 "label_id": 1,
                                 "label": "Panthera leo",
                                 "common_name": "Lion",
+                                "class_": "Mammalia",
+                                "order": "Carnivora",
+                                "family": "Felidae",
+                                "genus": "Panthera",
+                                "species": "Panthera leo",
                             }
                         ]
                     ),
@@ -694,6 +703,27 @@ class TestGetPhoneObservationData:
         wide = phone_observations_to_wide(long)
         assert wide.loc[0, "Taxonomic label"] == "Panthera leo"
         assert wide.loc[0, "Notes"] == "seen at dusk"
+        assert wide.loc[0, "common_name"] == "Lion"
+        assert wide.loc[0, "family"] == "Felidae"
+        assert wide.loc[0, "genus"] == "Panthera"
+        assert wide.loc[0, "species"] == "Panthera leo"
+        assert wide.loc[0, "class"] == "Mammalia"
+
+    def test_wide_repairs_macroman_mojibake(self):
+        long = pd.DataFrame(
+            [
+                {
+                    "feature_uuid": "f1",
+                    "longitude": 1.0,
+                    "latitude": 2.0,
+                    "item_name": "Nom commun",
+                    "data_type": "text",
+                    "data": "Bulbul verd√¢tre",
+                }
+            ]
+        )
+        wide = phone_observations_to_wide(long, include_iucn=False)
+        assert wide.loc[0, "Nom commun"] == "Bulbul verdâtre"
 
     def test_retries_on_http_429(self, hdr):
         limited = MagicMock()
