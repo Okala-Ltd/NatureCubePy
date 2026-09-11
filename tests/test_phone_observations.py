@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -16,6 +17,9 @@ from naturecubepy.phone_observations import (
     build_device_settings,
     build_feature_record,
     build_observation,
+    extract_taxonomic_label,
+    get_phone_observation_data,
+    phone_observations_to_wide,
     upload_phone_observations,
     validate_observation_payload,
 )
@@ -405,6 +409,321 @@ class TestCollectPendingMedia:
         )
         media = _collect_pending_media([obs], tmp_path)
         assert media == []
+
+
+# ---------------------------------------------------------------------------
+# get_phone_observation_data
+# ---------------------------------------------------------------------------
+
+class TestGetPhoneObservationData:
+    def test_paginates_csv_with_keyset_cursor(self, hdr):
+        page1 = MagicMock()
+        page1.status_code = 200
+        page1.headers = {
+            "content-type": "text/csv",
+            "X-Next-Observation-Id": "102",
+        }
+        page1.raise_for_status = MagicMock()
+        page1.content = (
+            b"observation_id,item_name,data_type,data\n"
+            b"101,Notes,text,hello\n"
+            b"102,Notes,text,world\n"
+        )
+
+        page2 = MagicMock()
+        page2.status_code = 200
+        page2.headers = {"content-type": "text/csv"}
+        page2.raise_for_status = MagicMock()
+        page2.content = (
+            b"observation_id,item_name,data_type,data\n"
+            b"103,Notes,text,again\n"
+        )
+
+        with patch(
+            "naturecubepy.phone_observations.httpx.get",
+            side_effect=[page1, page2],
+        ) as get:
+            result = get_phone_observation_data(
+                hdr,
+                procedure_id=7,
+                data_type="text",
+                page_size=2,
+                project_id=42,
+            )
+
+        assert list(result["observation_id"]) == [101, 102, 103]
+        assert get.call_count == 2
+        first_params = get.call_args_list[0].kwargs["params"]
+        second_params = get.call_args_list[1].kwargs["params"]
+        assert first_params["limit"] == 2
+        assert "after_observation_id" not in first_params
+        assert second_params["after_observation_id"] == 102
+
+    def test_empty_media_page_returns_empty_dataframe(self, hdr):
+        empty = MagicMock()
+        empty.status_code = 200
+        empty.headers = {"content-type": "application/json"}
+        empty.raise_for_status = MagicMock()
+        empty.json.return_value = {
+            "download_url": "",
+            "expires_at": "",
+            "row_count": 0,
+            "media_count": 0,
+            "format": "zip",
+            "filename": "",
+            "size_bytes": 0,
+        }
+        with patch("naturecubepy.phone_observations.httpx.get", return_value=empty):
+            result = get_phone_observation_data(
+                hdr, procedure_id=7, data_type="phone-photo", project_id=42
+            )
+        assert result.empty
+
+    def test_rejects_invalid_data_type(self, hdr):
+        with pytest.raises(ValueError, match="Unsupported data_type"):
+            get_phone_observation_data(
+                hdr, procedure_id=7, data_type="instruction", project_id=42
+            )
+
+    def test_media_export_reads_csv_from_zip(self, hdr, tmp_path):
+        import io
+        from zipfile import ZipFile, ZIP_DEFLATED
+
+        buf = io.BytesIO()
+        with ZipFile(buf, "w", ZIP_DEFLATED) as zf:
+            zf.writestr(
+                "observations.csv",
+                "observation_id,item_name,data_type,data\n"
+                "201,Photo,phone-photo,path/a.jpg\n",
+            )
+            zf.writestr("media/a.jpg", b"fake-image-bytes")
+        zip_bytes = buf.getvalue()
+
+        meta = MagicMock()
+        meta.status_code = 200
+        meta.headers = {"content-type": "application/json"}
+        meta.raise_for_status = MagicMock()
+        meta.json.return_value = {
+            "download_url": "https://example.test/export.zip",
+            "row_count": 1,
+            "media_count": 1,
+            "format": "zip",
+            "filename": "export.zip",
+            "size_bytes": len(zip_bytes),
+            "expires_at": "2026-01-01T00:00:00Z",
+        }
+
+        zip_resp = MagicMock()
+        zip_resp.raise_for_status = MagicMock()
+        zip_resp.content = zip_bytes
+
+        with patch(
+            "naturecubepy.phone_observations.httpx.get",
+            side_effect=[meta, zip_resp],
+        ):
+            result = get_phone_observation_data(
+                hdr,
+                procedure_id=7,
+                data_type="phone-photo",
+                media_dir=tmp_path / "media",
+                project_id=42,
+            )
+
+        assert len(result) == 1
+        assert int(result["observation_id"].iloc[0]) == 201
+        assert (tmp_path / "media" / "phone-photo" / "a.jpg").read_bytes() == b"fake-image-bytes"
+
+    def test_resolves_project_id_from_api_key(self, hdr):
+        project_resp = MagicMock()
+        project_resp.raise_for_status = MagicMock()
+        project_resp.json.return_value = {
+            "boundary": {
+                "type": "FeatureCollection",
+                "features": [
+                    {
+                        "type": "Feature",
+                        "properties": {"project_id": 99, "project_name": "Demo"},
+                        "geometry": {"type": "Point", "coordinates": [0, 0]},
+                    }
+                ],
+            }
+        }
+
+        page = MagicMock()
+        page.status_code = 200
+        page.headers = {"content-type": "text/csv"}
+        page.raise_for_status = MagicMock()
+        page.content = b"observation_id,item_name,data_type,data\n11,Notes,text,hi\n"
+
+        with patch(
+            "naturecubepy.phone_observations.httpx.get",
+            side_effect=[project_resp, page],
+        ) as get:
+            result = get_phone_observation_data(
+                hdr, procedure_id=7, data_type="text"
+            )
+
+        assert list(result["observation_id"]) == [11]
+        assert "/getProject/" in get.call_args_list[0].args[0]
+        assert "/getPhoneObservations/" in get.call_args_list[1].args[0]
+        assert "/99/" in get.call_args_list[1].args[0]
+
+    def test_phone_observations_to_wide(self):
+        long = pd.DataFrame(
+            [
+                {
+                    "feature_uuid": "f1",
+                    "longitude": 1.0,
+                    "latitude": 2.0,
+                    "item_name": "Notes",
+                    "data": "hello",
+                },
+                {
+                    "feature_uuid": "f1",
+                    "longitude": 1.0,
+                    "latitude": 2.0,
+                    "item_name": "Count",
+                    "data": "3",
+                },
+                {
+                    "feature_uuid": "f2",
+                    "longitude": 3.0,
+                    "latitude": 4.0,
+                    "item_name": "Notes",
+                    "data": "bye",
+                },
+            ]
+        )
+        wide = phone_observations_to_wide(long)
+        assert list(wide["feature_uuid"]) == ["f1", "f2"]
+        assert "Notes" in wide.columns and "Count" in wide.columns
+        row1 = wide.set_index("feature_uuid").loc["f1"]
+        assert row1["Notes"] == "hello"
+        assert row1["Count"] == "3"
+
+    def test_wide_keeps_all_items_when_coords_drift(self):
+        """GPS noise within a feature must not split/sparsify wide rows."""
+        long = pd.DataFrame(
+            [
+                {
+                    "feature_uuid": "f1",
+                    "longitude": 1.0,
+                    "latitude": 2.0,
+                    "item_name": "Notes",
+                    "data": "hello",
+                },
+                {
+                    "feature_uuid": "f1",
+                    "longitude": 1.0000001,
+                    "latitude": 2.0,
+                    "item_name": "Count",
+                    "data": "3",
+                },
+                {
+                    "feature_uuid": "f2",
+                    "longitude": 3.0,
+                    "latitude": 4.0,
+                    "item_name": "Notes",
+                    "data": "bye",
+                },
+            ]
+        )
+        wide = phone_observations_to_wide(long)
+        assert len(wide) == 2
+        row1 = wide.set_index("feature_uuid").loc["f1"]
+        assert row1["Notes"] == "hello"
+        assert row1["Count"] == "3"
+
+    def test_wide_preserves_list_valued_data(self):
+        long = pd.DataFrame(
+            [
+                {
+                    "feature_uuid": "f1",
+                    "longitude": 1.0,
+                    "latitude": 2.0,
+                    "item_name": "Notes",
+                    "data_type": "text",
+                    "data": ["hello", "world"],
+                }
+            ]
+        )
+        wide = phone_observations_to_wide(long)
+        assert wide.loc[0, "Notes"] == "hello, world"
+
+    def test_extracts_taxonomic_label_in_wide(self):
+        long = pd.DataFrame(
+            [
+                {
+                    "feature_uuid": "f1",
+                    "longitude": 1.0,
+                    "latitude": 2.0,
+                    "item_name": "Taxonomic label",
+                    "data_type": "label",
+                    "data": json.dumps(
+                        [
+                            {
+                                "label_id": 1,
+                                "label": "Panthera leo",
+                                "common_name": "Lion",
+                                "species": "Panthera leo",
+                            }
+                        ]
+                    ),
+                    "labels": json.dumps(
+                        [
+                            {
+                                "label_id": 1,
+                                "label": "Panthera leo",
+                                "common_name": "Lion",
+                            }
+                        ]
+                    ),
+                },
+                {
+                    "feature_uuid": "f1",
+                    "longitude": 1.0,
+                    "latitude": 2.0,
+                    "item_name": "Notes",
+                    "data_type": "text",
+                    "data": "seen at dusk",
+                    "labels": "",
+                },
+            ]
+        )
+        assert extract_taxonomic_label(long.loc[0, "data"]) == "Panthera leo"
+        wide = phone_observations_to_wide(long)
+        assert wide.loc[0, "Taxonomic label"] == "Panthera leo"
+        assert wide.loc[0, "Notes"] == "seen at dusk"
+
+    def test_retries_on_http_429(self, hdr):
+        limited = MagicMock()
+        limited.status_code = 429
+        limited.headers = {"Retry-After": "0"}
+        limited.raise_for_status = MagicMock(
+            side_effect=httpx.HTTPStatusError(
+                "429", request=MagicMock(), response=limited
+            )
+        )
+
+        ok = MagicMock()
+        ok.status_code = 200
+        ok.headers = {"content-type": "text/csv"}
+        ok.raise_for_status = MagicMock()
+        ok.content = b"observation_id,item_name,data_type,data\n11,Notes,text,hi\n"
+
+        with (
+            patch(
+                "naturecubepy.phone_observations.httpx.get",
+                side_effect=[limited, ok],
+            ),
+            patch("naturecubepy.phone_observations.time.sleep") as sleep,
+        ):
+            result = get_phone_observation_data(
+                hdr, procedure_id=7, data_type="text", project_id=42
+            )
+
+        assert list(result["observation_id"]) == [11]
+        sleep.assert_called_once()
 
 
 # ---------------------------------------------------------------------------

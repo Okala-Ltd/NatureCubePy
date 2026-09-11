@@ -1,21 +1,25 @@
 """
-Phone observation builders and upload functions for the Okala dashboard.
+Phone observation builders, upload, and download helpers for the Okala dashboard.
 
 This module provides functions for constructing structured observation records
-from mobile devices (photos, videos, audio, and form data) and uploading them
-to the Okala platform.
+from mobile devices (photos, videos, audio, and form data), uploading them to
+the Okala platform, and downloading phone observations via the API-key export
+endpoint.
 """
 
 from __future__ import annotations
 
+import io
 import json
 import mimetypes
 import re
+import time
 import unicodedata
 import uuid as uuid_lib
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
+from zipfile import ZipFile
 
 import httpx
 import pandas as pd
@@ -33,6 +37,35 @@ PHONE_TYPES = (
     "label",
     "instruction",
 )
+
+#: Data types supported by ``GET /getPhoneObservations/...`` exports.
+#: Tabular types first so ``data_type="all"`` builds the form table before media ZIPs.
+PHONE_OBSERVATION_EXPORT_TYPES = (
+    "choice",
+    "text",
+    "numeric",
+    "label",
+    "phone-photo",
+    "phone-video",
+    "phone-audio",
+)
+
+PhoneObservationExportType = Literal[
+    "phone-photo",
+    "phone-video",
+    "phone-audio",
+    "choice",
+    "text",
+    "numeric",
+    "label",
+]
+
+_MEDIA_EXPORT_TYPES = frozenset({"phone-photo", "phone-video", "phone-audio"})
+_PHONE_PAGE_SIZE = 1000
+_PHONE_PAGE_TIMEOUT = 180.0
+_PHONE_MAX_RETRIES = 6
+_PHONE_RETRY_BASE_SECONDS = 2.0
+_PHONE_RATE_LIMIT_FALLBACK_SECONDS = 60.0
 
 _VALID_GEOM_TYPES = ("Point", "Polygon", "LineString")
 _MEDIA_TYPES = ("phone-photo", "phone-video", "phone-audio")
@@ -1023,6 +1056,660 @@ def get_procedure(
     )
     print(items.to_string(index=False))
     return out
+
+
+def _normalise_phone_export_types(
+    data_type: PhoneObservationExportType | list[PhoneObservationExportType] | str,
+) -> list[str]:
+    """Validate and expand phone observation export type(s)."""
+    if isinstance(data_type, str) and data_type.strip().lower() == "all":
+        return list(PHONE_OBSERVATION_EXPORT_TYPES)
+    types = [data_type] if isinstance(data_type, str) else list(data_type)
+    if not types:
+        raise ValueError("data_type must contain at least one export type.")
+    normalised: list[str] = []
+    seen: set[str] = set()
+    for raw in types:
+        value = str(raw).strip()
+        if value not in PHONE_OBSERVATION_EXPORT_TYPES:
+            raise ValueError(
+                f"Unsupported data_type '{value}'. "
+                f"Allowed: {', '.join(PHONE_OBSERVATION_EXPORT_TYPES)} (or 'all')."
+            )
+        if value not in seen:
+            normalised.append(value)
+            seen.add(value)
+    return normalised
+
+
+def _phone_observations_url(
+    hdr: AuthHeaders,
+    project_id: int,
+    procedure_id: int,
+    data_type: str,
+) -> str:
+    return (
+        f"{hdr.root}getPhoneObservations/{hdr.key}/"
+        f"{int(project_id)}/{int(procedure_id)}/{data_type}"
+    )
+
+
+def _dataframe_from_phone_export_response(
+    response: httpx.Response,
+    *,
+    media_dir: Path | None = None,
+) -> pd.DataFrame:
+    """Parse one export page (CSV body or media ZIP JSON) into a DataFrame."""
+    content_type = (response.headers.get("content-type") or "").lower()
+    if "application/json" in content_type:
+        payload = response.json()
+        if isinstance(payload, list):
+            return pd.DataFrame(payload)
+        if not isinstance(payload, dict):
+            raise RuntimeError(
+                f"Unexpected phone-observation export JSON type: {type(payload).__name__}"
+            )
+        if "detail" in payload and "download_url" not in payload:
+            raise RuntimeError(f"Phone observation export failed: {payload['detail']}")
+
+        download_url = str(
+            payload.get("download_url")
+            or payload.get("signed_url")
+            or payload.get("url")
+            or ""
+        ).strip()
+        # Empty media pages return download_url="" with row_count=0.
+        if not download_url:
+            if int(payload.get("row_count") or 0) == 0:
+                return pd.DataFrame()
+            raise RuntimeError(
+                "Media phone-observation export did not include download_url. "
+                f"Response keys: {sorted(payload.keys())}; payload={payload!r}"
+            )
+
+        zip_response = httpx.get(
+            download_url, follow_redirects=True, timeout=_PHONE_PAGE_TIMEOUT
+        )
+        zip_response.raise_for_status()
+        with ZipFile(io.BytesIO(zip_response.content)) as zf:
+            try:
+                with zf.open("observations.csv") as handle:
+                    frame = pd.read_csv(handle)
+            except KeyError as exc:
+                raise RuntimeError(
+                    "Media export ZIP did not contain observations.csv."
+                ) from exc
+            if media_dir is not None:
+                media_dir.mkdir(parents=True, exist_ok=True)
+                for name in zf.namelist():
+                    if not name.startswith("media/") or name.endswith("/"):
+                        continue
+                    target = media_dir / Path(name).name
+                    with zf.open(name) as src, target.open("wb") as dst:
+                        dst.write(src.read())
+        return frame
+
+    # Non-media exports stream text/csv (sometimes with charset).
+    raw = response.content
+    if raw is None:
+        return pd.DataFrame()
+    if isinstance(raw, bytes):
+        if not raw.strip():
+            return pd.DataFrame()
+        return pd.read_csv(io.BytesIO(raw))
+    text = str(raw).lstrip()
+    if not text:
+        return pd.DataFrame()
+    return pd.read_csv(io.StringIO(text))
+
+
+def _header_int(response: httpx.Response, *names: str) -> int | None:
+    """Read an integer header (case-insensitive names)."""
+    for name in names:
+        raw = response.headers.get(name)
+        if raw is None or str(raw).strip() == "":
+            continue
+        try:
+            return int(raw)
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def _phone_retry_after_seconds(response: httpx.Response, attempt: int) -> float:
+    """Compute wait time for a rate-limited phone-export request."""
+    header = response.headers.get("Retry-After")
+    if header:
+        try:
+            return max(float(header), _PHONE_RETRY_BASE_SECONDS)
+        except ValueError:
+            pass
+    return _PHONE_RATE_LIMIT_FALLBACK_SECONDS * (1 + 0.5 * attempt)
+
+
+def _get_phone_observation_page(
+    url: str,
+    *,
+    params: dict[str, int],
+    timeout: float,
+) -> httpx.Response:
+    """GET one export page, retrying on HTTP 429."""
+    for attempt in range(_PHONE_MAX_RETRIES + 1):
+        response = httpx.get(url, params=params, timeout=timeout)
+        if response.status_code != 429 or attempt >= _PHONE_MAX_RETRIES:
+            return response
+        wait = _phone_retry_after_seconds(response, attempt)
+        print(
+            f"  Rate limited; waiting {wait:.0f}s "
+            f"(retry {attempt + 1}/{_PHONE_MAX_RETRIES})..."
+        )
+        time.sleep(wait)
+    return response  # pragma: no cover
+
+
+def _iter_phone_observation_pages(
+    hdr: AuthHeaders,
+    project_id: int,
+    procedure_id: int,
+    data_type: str,
+    *,
+    page_size: int,
+    timeout: float,
+    media_dir: Path | None = None,
+) -> list[pd.DataFrame]:
+    """Fetch all pages for one data_type via keyset pagination."""
+    url = _phone_observations_url(hdr, project_id, procedure_id, data_type)
+    frames: list[pd.DataFrame] = []
+    after_observation_id: int | None = None
+    seen_cursors: set[int] = set()
+    total_reported: int | None = None
+
+    while True:
+        params: dict[str, int] = {"limit": min(int(page_size), _PHONE_PAGE_SIZE)}
+        if after_observation_id is not None:
+            params["after_observation_id"] = after_observation_id
+        else:
+            params["offset"] = 0
+
+        response = _get_phone_observation_page(url, params=params, timeout=timeout)
+        if response.status_code == 404:
+            # Empty first page (or exhausted) — no rows for this type.
+            break
+        response.raise_for_status()
+
+        if total_reported is None:
+            total_reported = _header_int(response, "X-Total-Count", "x-total-count")
+
+        frame = _dataframe_from_phone_export_response(response, media_dir=media_dir)
+        if frame.empty:
+            break
+        frames.append(frame)
+
+        fetched = sum(len(f) for f in frames)
+        next_id = _header_int(
+            response, "X-Next-Observation-Id", "x-next-observation-id"
+        )
+
+        # Some gateways strip custom headers. If the page looks full — or the
+        # server reported a higher total — keep going with max(observation_id).
+        if next_id is None and "observation_id" in frame.columns and not frame.empty:
+            page_ids = pd.to_numeric(frame["observation_id"], errors="coerce").dropna()
+            if not page_ids.empty:
+                page_max = int(page_ids.max())
+                page_full = len(frame) >= params["limit"]
+                more_by_total = total_reported is not None and fetched < total_reported
+                if page_full or more_by_total:
+                    next_id = page_max
+
+        if next_id is None:
+            break
+        if next_id in seen_cursors:
+            break
+        seen_cursors.add(next_id)
+        after_observation_id = next_id
+
+    if frames:
+        n = sum(len(f) for f in frames)
+        total_msg = (
+            f", server total={total_reported}" if total_reported is not None else ""
+        )
+        print(f"  → {n} rows{total_msg}")
+    return frames
+
+
+def _resolve_project_id(
+    hdr: AuthHeaders,
+    project_id: int | None,
+    *,
+    timeout: float,
+) -> int:
+    """Return ``project_id``, resolving it from the API key when omitted."""
+    if project_id is not None:
+        pid = int(project_id)
+        if pid <= 0:
+            raise ValueError("project_id must be a positive integer.")
+        return pid
+
+    url = f"{hdr.root}getProject/{hdr.key}"
+    response = httpx.get(url, timeout=timeout)
+    response.raise_for_status()
+    data = response.json()
+    features = ((data.get("boundary") or {}).get("features") or [])
+    if not features:
+        raise ValueError(
+            "Could not resolve project_id from API key: empty project boundary."
+        )
+    props = features[0].get("properties") or {}
+    pid = props.get("project_id")
+    if pid is None or int(pid) <= 0:
+        raise ValueError(
+            "Could not resolve project_id from API key response "
+            "(missing or invalid boundary.features[0].properties.project_id)."
+        )
+    return int(pid)
+
+
+def _resolve_procedure_ids(
+    hdr: AuthHeaders,
+    procedure_id: int | list[int] | str,
+    *,
+    timeout: float,
+) -> list[int]:
+    """Normalise ``procedure_id`` / ``\"all\"`` to a list of positive ints."""
+    if isinstance(procedure_id, str) and procedure_id.strip().lower() == "all":
+        schema = get_project_systems(hdr, timeout=timeout)
+        systems = list_systems(schema)
+        if systems.empty or "procedure_id" not in systems.columns:
+            raise ValueError("No procedures found in project schema.")
+        ids = (
+            pd.to_numeric(systems["procedure_id"], errors="coerce")
+            .dropna()
+            .astype(int)
+            .unique()
+            .tolist()
+        )
+        if not ids:
+            raise ValueError("No procedures found in project schema.")
+        return ids
+    if isinstance(procedure_id, (list, tuple, set)):
+        ids = [int(x) for x in procedure_id]
+    else:
+        ids = [int(procedure_id)]
+    if not ids or any(i <= 0 for i in ids):
+        raise ValueError("procedure_id must be a positive integer, a list of ids, or 'all'.")
+    # Preserve order, drop duplicates.
+    seen: set[int] = set()
+    out: list[int] = []
+    for i in ids:
+        if i not in seen:
+            out.append(i)
+            seen.add(i)
+    return out
+
+
+def get_phone_observation_data(
+    hdr: AuthHeaders,
+    procedure_id: int | list[int] | str,
+    data_type: PhoneObservationExportType | list[PhoneObservationExportType] | str = "all",
+    *,
+    project_id: int | None = None,
+    page_size: int = _PHONE_PAGE_SIZE,
+    timeout: float = _PHONE_PAGE_TIMEOUT,
+    media_dir: str | Path | None = None,
+    wide: bool = False,
+) -> pd.DataFrame:
+    """Download phone observations for a project procedure as a DataFrame.
+
+    Wraps ``GET /api/getPhoneObservations/{api_key}/{project_id}/{procedure_id}/{data_type}``.
+    Non-media types (``text``, ``choice``, ``numeric``, ``label``) return CSV
+    pages. Media types (``phone-photo``, ``phone-video``, ``phone-audio``) return
+    a ZIP download URL; this helper follows the link and reads ``observations.csv``
+    from each page. Pass ``media_dir`` to also extract media files from those ZIPs.
+
+    Parameters
+    ----------
+    hdr:
+        Authentication context returned by :func:`~naturecubepy.api.auth_headers`.
+    procedure_id:
+        Procedure ID (from :func:`get_procedure` / :func:`list_systems`), a list
+        of IDs, or ``\"all\"`` to download every procedure in the project schema.
+    data_type:
+        One export type, a list of types, or ``"all"`` for every supported type.
+    project_id:
+        Optional project ID. When omitted, resolved automatically from the API
+        key via ``GET /getProject/{api_key}``.
+    page_size:
+        Rows per request (max 1000).
+    timeout:
+        Per-request timeout in seconds.
+    media_dir:
+        Optional directory to extract media files into for media export types.
+    wide:
+        If ``True``, pivot to one row per feature with ``item_name`` values as
+        column headers (see :func:`phone_observations_to_wide`).
+
+    Returns
+    -------
+    pandas.DataFrame
+        Observation rows with columns such as ``feature_uuid``, ``observation_id``,
+        ``item_name``, ``data_type``, ``data``, ``latitude``, ``longitude``, and
+        taxonomic ``labels`` (JSON string when present). Empty when nothing matches.
+        When ``wide=True``, one row per feature and one column per item name.
+
+    Examples
+    --------
+    >>> df = get_phone_observation_data(hdr, procedure_id=7, data_type="label")  # doctest: +SKIP
+    >>> wide = get_phone_observation_data(hdr, procedure_id=7, wide=True)  # doctest: +SKIP
+    >>> all_procs = get_phone_observation_data(hdr, procedure_id="all", wide=True)  # doctest: +SKIP
+    """
+    project_id = _resolve_project_id(hdr, project_id, timeout=timeout)
+    procedure_ids = _resolve_procedure_ids(hdr, procedure_id, timeout=timeout)
+    if page_size < 1:
+        raise ValueError("page_size must be >= 1.")
+
+    types = _normalise_phone_export_types(data_type)
+    out_dir = Path(media_dir) if media_dir is not None else None
+    frames: list[pd.DataFrame] = []
+
+    for proc_id in procedure_ids:
+        if len(procedure_ids) > 1:
+            print(f"Procedure {proc_id}:")
+        for dtype in types:
+            type_media_dir = None
+            if out_dir is not None and dtype in _MEDIA_EXPORT_TYPES:
+                type_media_dir = out_dir / dtype
+            print(f"Downloading phone observations ({dtype})...")
+            try:
+                pages = _iter_phone_observation_pages(
+                    hdr,
+                    project_id,
+                    proc_id,
+                    dtype,
+                    page_size=page_size,
+                    timeout=timeout,
+                    media_dir=type_media_dir,
+                )
+            except httpx.HTTPStatusError as exc:
+                if exc.response is not None and exc.response.status_code == 404:
+                    continue
+                raise
+            if pages:
+                frames.extend(pages)
+
+    if not frames:
+        return pd.DataFrame()
+    result = pd.concat(frames, ignore_index=True, sort=False)
+    if "observation_id" in result.columns:
+        result = result.drop_duplicates(subset=["observation_id"], keep="first")
+    result = _normalise_taxonomic_label_values(result.reset_index(drop=True))
+    n_features = (
+        result["feature_uuid"].nunique(dropna=True)
+        if "feature_uuid" in result.columns
+        else None
+    )
+    if n_features is not None:
+        print(f"Combined: {len(result)} observation rows across {n_features} feature(s)")
+    if wide:
+        return phone_observations_to_wide(result)
+    return result
+
+
+_FEATURE_WIDE_INDEX_COLS = (
+    "feature_uuid",
+    "project_system_id",
+    "procedure_id",
+    "procedure_name",
+    "system_name",
+    "procedure_start_timestamp",
+    "procedure_end_timestamp",
+    "feature_uploaded_at",
+    "feature_geometry",
+    "longitude",
+    "latitude",
+    "username",
+    "phone_model",
+    "phone_operating_system",
+)
+
+
+def _parse_labels_payload(value: Any) -> list[dict[str, Any]] | None:
+    """Return a list of label dicts from JSON/list/dict, else ``None``.
+
+    Empty lists and lists without dict items are treated as non-label values so
+    plain list-like ``data`` cells are not wiped during normalisation.
+    """
+    if value is None:
+        return None
+    try:
+        if isinstance(value, float) and pd.isna(value):
+            return None
+    except (TypeError, ValueError):
+        pass
+
+    if isinstance(value, dict):
+        return [value]
+    if isinstance(value, list):
+        labels = [item for item in value if isinstance(item, dict)]
+        return labels or None
+
+    text = str(value).strip()
+    if not text or text.lower() in {"nan", "none", "null"}:
+        return None
+    if not (text.startswith("[") or text.startswith("{")):
+        return None
+    try:
+        parsed = json.loads(text)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
+    if isinstance(parsed, dict):
+        return [parsed]
+    if isinstance(parsed, list):
+        labels = [item for item in parsed if isinstance(item, dict)]
+        return labels or None
+    return None
+
+
+def extract_taxonomic_label(value: Any) -> str:
+    """Extract display label text from a phone-observation labels payload.
+
+    Accepts the JSON/list form produced by the API export, e.g.
+    ``[{"label_id": 1, "label": "Panthera leo", "common_name": "Lion", ...}]``,
+    and returns the ``label`` field(s) joined with ``", "``. Plain strings are
+    returned unchanged.
+    """
+    labels = _parse_labels_payload(value)
+    if labels is None:
+        if value is None:
+            return ""
+        try:
+            if isinstance(value, float) and pd.isna(value):
+                return ""
+        except (TypeError, ValueError):
+            pass
+        text = str(value).strip()
+        # Double-encoded JSON string: "\"[{...}]\""
+        if len(text) >= 2 and text[0] == text[-1] == '"':
+            try:
+                inner = json.loads(text)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                inner = None
+            if inner is not None:
+                return extract_taxonomic_label(inner)
+        return "" if text.lower() in {"nan", "none", "null"} else text
+
+    names: list[str] = []
+    for item in labels:
+        name = item.get("label") or item.get("species") or item.get("common_name")
+        if name is None:
+            continue
+        text = str(name).strip()
+        if text:
+            names.append(text)
+    return ", ".join(names)
+
+
+def _normalise_taxonomic_label_values(df: pd.DataFrame) -> pd.DataFrame:
+    """Replace taxonomic label JSON in ``data`` with extracted label text."""
+    if df.empty or "data" not in df.columns:
+        return df
+
+    work = df.copy()
+    is_label_type = (
+        work["data_type"].astype(str).str.strip().str.lower().eq("label")
+        if "data_type" in work.columns
+        else pd.Series(False, index=work.index)
+    )
+    looks_like_json = work["data"].map(lambda v: _parse_labels_payload(v) is not None)
+    mask = is_label_type | looks_like_json
+    if not bool(mask.any()):
+        return work
+
+    def _replace(row: pd.Series) -> Any:
+        for candidate in (row.get("labels"), row.get("data")):
+            extracted = extract_taxonomic_label(candidate)
+            if extracted:
+                return extracted
+        raw = row.get("data")
+        return pd.NA if pd.isna(raw) else ""
+
+    work.loc[mask, "data"] = work.loc[mask].apply(_replace, axis=1)
+    return work
+
+
+def _format_wide_cell_value(value: Any) -> str:
+    """Coerce a long-format cell into a clean wide-format string."""
+    if value is None:
+        return ""
+    try:
+        if isinstance(value, float) and pd.isna(value):
+            return ""
+    except (TypeError, ValueError):
+        pass
+    if isinstance(value, (list, tuple)):
+        parts = [_format_wide_cell_value(v) for v in value]
+        return ", ".join(p for p in parts if p.strip())
+    text = str(value).strip()
+    if not text or text.lower() in {"nan", "none", "null"}:
+        return ""
+    return text
+
+
+def _first_non_null(series: pd.Series) -> Any:
+    """Return the first non-null / non-blank value in a series."""
+    for value in series.tolist():
+        if value is None:
+            continue
+        try:
+            if isinstance(value, float) and pd.isna(value):
+                continue
+        except (TypeError, ValueError):
+            pass
+        if isinstance(value, str) and not value.strip():
+            continue
+        return value
+    return pd.NA
+
+
+def phone_observations_to_wide(
+    df: pd.DataFrame,
+    *,
+    index_cols: list[str] | None = None,
+    item_col: str = "item_name",
+    value_col: str = "data",
+) -> pd.DataFrame:
+    """Pivot long phone-observation rows to one row per feature.
+
+    ``item_name`` values become column headers and ``data`` fills the cells,
+    matching the dashboard CSV ``pivoted=True`` export. Multiple values for the
+    same feature/item are joined with ``", "``. Taxonomic ``label`` rows have
+    their JSON ``labels`` payload reduced to the species ``label`` text.
+
+    Parameters
+    ----------
+    df:
+        Long-format table from :func:`get_phone_observation_data`.
+    index_cols:
+        Feature-level columns to keep alongside the pivoted item columns.
+        Defaults to feature metadata columns present in ``df``. Must include
+        ``feature_uuid`` (or it is added when available).
+    item_col:
+        Column holding field names (default ``item_name``).
+    value_col:
+        Column holding field values (default ``data``). Falls back to
+        ``labels`` when ``data`` is null.
+
+    Returns
+    -------
+    pandas.DataFrame
+        Wide table with one row per feature and one column per item name.
+    """
+    if df.empty:
+        return df.copy()
+    if item_col not in df.columns:
+        raise ValueError(f"Expected '{item_col}' column for wide pivot.")
+    if "feature_uuid" not in df.columns:
+        raise ValueError("Cannot pivot: expected a 'feature_uuid' column.")
+
+    work = _normalise_taxonomic_label_values(df)
+    if value_col not in work.columns:
+        if "labels" in work.columns:
+            value_col = "labels"
+        else:
+            raise ValueError(
+                f"Expected '{value_col}' (or 'labels') column for wide pivot."
+            )
+
+    if index_cols is None:
+        index_cols = [c for c in _FEATURE_WIDE_INDEX_COLS if c in work.columns]
+    else:
+        missing = [c for c in index_cols if c not in work.columns]
+        if missing:
+            raise ValueError(f"index_cols not found in frame: {missing}")
+    if "feature_uuid" not in index_cols:
+        index_cols = ["feature_uuid", *index_cols]
+
+    value_series = work[value_col]
+    if "labels" in work.columns and value_col != "labels":
+        # Prefer extracted label text already written to data; otherwise labels JSON.
+        fallback = work["labels"].map(extract_taxonomic_label)
+        value_series = value_series.where(
+            value_series.notna() & (value_series.map(_format_wide_cell_value) != ""),
+            fallback,
+        )
+    work = work.copy()
+    work["_wide_value"] = value_series.map(_format_wide_cell_value)
+    work[item_col] = work[item_col].map(
+        lambda v: "" if v is None or (isinstance(v, float) and pd.isna(v)) else str(v).strip()
+    )
+    work = work[work[item_col] != ""].copy()
+    if work.empty:
+        return work.iloc[0:0].copy()
+
+    # Pivot on feature_uuid only — never include lon/lat in the pivot index
+    # (that creates a cartesian product / sparse rows when coords drift).
+    pivoted = (
+        work.groupby(["feature_uuid", item_col], sort=False)["_wide_value"]
+        .agg(lambda s: ", ".join(v for v in s if str(v).strip()))
+        .unstack(item_col)
+        .reset_index()
+    )
+    pivoted.columns.name = None
+
+    meta_cols = [c for c in index_cols if c in work.columns]
+    meta = (
+        work[meta_cols]
+        .groupby("feature_uuid", sort=False, as_index=False)
+        .agg(_first_non_null)
+    )
+    # Preserve first-seen feature order from the long table.
+    feature_order = work["feature_uuid"].drop_duplicates().tolist()
+    meta = meta.set_index("feature_uuid").reindex(feature_order).reset_index()
+    wide = meta.merge(pivoted, on="feature_uuid", how="left")
+    item_cols = [c for c in wide.columns if c not in meta_cols]
+    print(
+        f"Wide: {len(wide)} feature row(s), {len(item_cols)} item column(s)"
+    )
+    return wide
 
 
 #: Delimiters used in CSVs when a choice field holds multiple selected values.
