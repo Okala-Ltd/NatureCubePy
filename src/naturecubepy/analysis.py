@@ -4,7 +4,9 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from math import exp, log
 from pathlib import Path
+import ast
 import warnings
 
 import geopandas as gpd
@@ -295,6 +297,29 @@ CONCERN_STATUSES = {
     "Near Threatened",
 }
 
+# IUCN equal-steps Red List Index weights (Butchart et al. 2007).
+# Data Deficient / Not Evaluated / Not Applicable are excluded from the index.
+RLI_CATEGORY_WEIGHTS: dict[str, int] = {
+    "Least Concern": 0,
+    "LC": 0,
+    "Near Threatened": 1,
+    "NT": 1,
+    "Vulnerable": 2,
+    "VU": 2,
+    "Endangered": 3,
+    "EN": 3,
+    "Critically Endangered": 4,
+    "CR": 4,
+    "Extinct in the Wild": 5,
+    "EW": 5,
+    "Extinct": 5,
+    "EX": 5,
+}
+RLI_MAX_WEIGHT = 5
+
+# Free-form label tags that mark a species as invasive (case-insensitive substring).
+INVASIVE_TAG_MARKERS = ("invasive",)
+
 def _normalise_sensor_label(value: object) -> str:
     mt = str(value).strip().lower()
     if mt == "camera":
@@ -304,6 +329,20 @@ def _normalise_sensor_label(value: object) -> str:
     if mt == "edna":
         return "eDNA"
     return "Unknown"
+
+
+# Display labels / row order for the report Sensor Summary table (Table 5.1).
+_SENSOR_SUMMARY_LABELS = {
+    "Camera": "Camera Traps",
+    "Bioacoustic": "Bioacoustic Sensors",
+    "eDNA": "Environmental DNA",
+}
+_SENSOR_SUMMARY_ORDER = (
+    "Camera Traps",
+    "Bioacoustic Sensors",
+    "Environmental DNA",
+)
+
 
 def _species_series(df: pd.DataFrame) -> pd.Series:
     if "species" in df.columns:
@@ -349,8 +388,40 @@ def species_per_class_table(camera_df: pd.DataFrame, bio_df: pd.DataFrame) -> pd
     )
     return out
 
-def station_summary_table(stations_df: pd.DataFrame) -> pd.DataFrame:
-    """Build the requested station summary table by sensor type."""
+def _resolve_observation_record_counts(
+    observation_counts: dict[str, int] | None,
+) -> dict[str, int] | None:
+    """Map caller keys (camera / Camera / Camera Traps) to Sensor Summary labels."""
+    if not observation_counts:
+        return None
+    resolved: dict[str, int] = {}
+    display_lookup = {
+        label.lower(): label for label in _SENSOR_SUMMARY_LABELS.values()
+    }
+    for raw_key, raw_value in observation_counts.items():
+        key = str(raw_key).strip()
+        display = display_lookup.get(key.lower())
+        if display is None:
+            normalised = _normalise_sensor_label(key)
+            display = _SENSOR_SUMMARY_LABELS.get(normalised, normalised)
+        try:
+            resolved[display] = int(raw_value)
+        except (TypeError, ValueError):
+            resolved[display] = 0
+    return resolved
+
+
+def station_summary_table(
+    stations_df: pd.DataFrame,
+    *,
+    observation_counts: dict[str, int] | None = None,
+) -> pd.DataFrame:
+    """Build the requested station summary table by sensor type.
+
+    ``Number of Records`` prefers labelled observation counts when provided
+    (e.g. rows in camera/bioacoustic/eDNA exports). Otherwise it falls back to
+    summing ``stations.record_count`` (raw media / system records).
+    """
     if stations_df.empty:
         return pd.DataFrame(
             columns=[
@@ -401,9 +472,26 @@ def station_summary_table(stations_df: pd.DataFrame) -> pd.DataFrame:
                 "_end": (end_col, "max") if end_col in df.columns else ("Sensor Type", "first"),
             }
         )
-        .sort_values("Sensor Type")
         .reset_index(drop=True)
     )
+
+    summary["Sensor Type"] = summary["Sensor Type"].map(
+        lambda value: _SENSOR_SUMMARY_LABELS.get(value, value)
+    )
+    order_index = {label: i for i, label in enumerate(_SENSOR_SUMMARY_ORDER)}
+    summary["_order"] = summary["Sensor Type"].map(
+        lambda value: order_index.get(value, len(order_index))
+    )
+    summary = summary.sort_values(["_order", "Sensor Type"], kind="stable").drop(
+        columns=["_order"]
+    )
+    summary = summary.reset_index(drop=True)
+
+    resolved_counts = _resolve_observation_record_counts(observation_counts)
+    if resolved_counts is not None:
+        summary["Number of Records"] = summary["Sensor Type"].map(
+            lambda value: int(resolved_counts.get(value, 0))
+        )
 
     if start_col in df.columns and end_col in df.columns:
         summary["Date Coverage"] = (
@@ -472,6 +560,244 @@ def major_concern_species_table(all_species_df: pd.DataFrame, top_n: int = 50) -
     concern = concern.sort_values(["iucn_redlist_status", "observation_count"], ascending=[True, False])
     return concern.head(top_n).reset_index(drop=True)
 
+
+def _species_abundance_counts(df: pd.DataFrame) -> pd.Series:
+    """Return non-empty species observation counts (abundance proxy)."""
+    species = _species_series(df)
+    species = species[species != ""]
+    if species.empty:
+        return pd.Series(dtype="int64")
+    return species.value_counts()
+
+
+def exponential_shannon_index(counts: pd.Series | list[float] | dict[str, float]) -> float:
+    """Hill number of order 1: ``exp(H')`` where ``H' = -Σ pᵢ ln pᵢ``.
+
+    Equivalent to the effective number of equally abundant species (Shannon diversity).
+    """
+    values = pd.Series(counts, dtype="float64")
+    values = values[values > 0]
+    if values.empty:
+        return float("nan")
+    proportions = values / values.sum()
+    shannon = float(-(proportions * proportions.map(log)).sum())
+    return float(exp(shannon))
+
+
+def inverse_simpson_index(counts: pd.Series | list[float] | dict[str, float]) -> float:
+    """Hill number of order 2: ``1 / Σ pᵢ²`` (inverse Simpson / Simpson diversity)."""
+    values = pd.Series(counts, dtype="float64")
+    values = values[values > 0]
+    if values.empty:
+        return float("nan")
+    proportions = values / values.sum()
+    return float(1.0 / (proportions * proportions).sum())
+
+
+def _normalise_iucn_status(value: object) -> str:
+    if value is None:
+        return ""
+    try:
+        if pd.isna(value):
+            return ""
+    except (TypeError, ValueError):
+        pass
+    text = str(value).strip()
+    if not text or text.lower() in {"nan", "none", "<na>"}:
+        return ""
+    return text
+
+
+def red_list_index(statuses: pd.Series | list[object]) -> float:
+    """IUCN equal-steps Red List Index for a set of species statuses.
+
+    ``RLI = 1 − Σ W(cₛ) / (N × W_EX)`` with ``W_EX = 5``. Species assessed as
+    Data Deficient, Not Evaluated, or Not Applicable are excluded. Returns
+    ``NaN`` when no eligible statuses remain.
+    """
+    weights: list[int] = []
+    for raw in statuses:
+        status = _normalise_iucn_status(raw)
+        if not status:
+            continue
+        weight = RLI_CATEGORY_WEIGHTS.get(status)
+        if weight is None:
+            # Accept spaced/cased variants already covered; skip unknown/DD/NE/NA.
+            continue
+        weights.append(weight)
+    n = len(weights)
+    if n == 0:
+        return float("nan")
+    return float(1.0 - (sum(weights) / (n * RLI_MAX_WEIGHT)))
+
+
+def _parse_tags(value: object) -> list[str]:
+    """Normalise a tags cell (list, delimited string, or literal list string)."""
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return []
+    if isinstance(value, (list, tuple, set)):
+        return [str(tag).strip() for tag in value if tag is not None and str(tag).strip()]
+    text = str(value).strip()
+    if not text or text.lower() in {"nan", "none", "<na>", "[]"}:
+        return []
+    if text.startswith("[") and text.endswith("]"):
+        try:
+            parsed = ast.literal_eval(text)
+        except (SyntaxError, ValueError):
+            parsed = None
+        if isinstance(parsed, (list, tuple, set)):
+            return [str(tag).strip() for tag in parsed if tag is not None and str(tag).strip()]
+    for sep in ("|", ";", ","):
+        if sep in text:
+            return [part.strip() for part in text.split(sep) if part.strip()]
+    return [text]
+
+
+def _tags_indicate_invasive(tags: list[str]) -> bool:
+    lowered = [tag.lower() for tag in tags]
+    return any(marker in tag for tag in lowered for marker in INVASIVE_TAG_MARKERS)
+
+
+def _species_tag_frame(all_species_df: pd.DataFrame) -> pd.DataFrame:
+    """One row per species with aggregated tags, IUCN status, and observation count."""
+    empty = pd.DataFrame(
+        columns=["species", "common_name", "iucn_redlist_status", "tags", "observation_count", "is_invasive"]
+    )
+    if all_species_df is None or all_species_df.empty:
+        return empty
+
+    df = all_species_df.copy()
+    df["species"] = _species_series(df)
+    df = df[df["species"] != ""]
+    if df.empty:
+        return empty
+
+    if "common_name" not in df.columns:
+        df["common_name"] = pd.NA
+    if "iucn_redlist_status" not in df.columns:
+        df["iucn_redlist_status"] = pd.NA
+    if "tags" not in df.columns:
+        df["tags"] = [[] for _ in range(len(df))]
+
+    rows: list[dict[str, object]] = []
+    for species, group in df.groupby("species", sort=False):
+        tag_set: list[str] = []
+        seen: set[str] = set()
+        for raw in group["tags"]:
+            for tag in _parse_tags(raw):
+                key = tag.lower()
+                if key not in seen:
+                    seen.add(key)
+                    tag_set.append(tag)
+        common = group["common_name"].dropna()
+        status = group["iucn_redlist_status"].dropna()
+        rows.append(
+            {
+                "species": species,
+                "common_name": common.iloc[0] if not common.empty else pd.NA,
+                "iucn_redlist_status": (
+                    status.iloc[0] if not status.empty else "Not Evaluated"
+                ),
+                "tags": tag_set,
+                "observation_count": int(len(group)),
+                "is_invasive": _tags_indicate_invasive(tag_set),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def invasive_species_table(all_species_df: pd.DataFrame) -> pd.DataFrame:
+    """List unique invasive-tagged species with observation counts.
+
+    A species is treated as invasive when any of its label ``tags`` contains
+    ``\"invasive\"`` (case-insensitive).
+    """
+    columns = ["species", "common_name", "iucn_redlist_status", "tags", "observation_count"]
+    summary = _species_tag_frame(all_species_df)
+    if summary.empty:
+        return pd.DataFrame(columns=columns)
+
+    invasive = summary[summary["is_invasive"]].copy()
+    if invasive.empty:
+        return pd.DataFrame(columns=columns)
+
+    invasive["tags"] = invasive["tags"].map(lambda tags: ", ".join(tags))
+    return (
+        invasive[columns]
+        .sort_values(["observation_count", "species"], ascending=[False, True])
+        .reset_index(drop=True)
+    )
+
+
+def species_measures_table(all_species_df: pd.DataFrame) -> pd.DataFrame:
+    """Compute community and conservation measures from species observations.
+
+    Returns a long measure/value table with:
+
+    - ``observed_richness``
+    - ``exponential_shannon`` (Shannon diversity / Hill q=1)
+    - ``inverse_simpson`` (Simpson diversity / Hill q=2)
+    - ``red_list_index`` (IUCN equal-steps RLI over unique assessed species)
+    - ``percent_invasive`` and ``invasive_species_count``
+    - ``invasive_species`` (comma-separated scientific names)
+
+    Diversity indices use observation counts per species as the abundance
+    proxy. Invasive status is inferred from label ``tags``.
+    """
+    measures = [
+        "observed_richness",
+        "exponential_shannon",
+        "inverse_simpson",
+        "red_list_index",
+        "percent_invasive",
+        "invasive_species_count",
+        "invasive_species",
+        "assessed_species_count",
+        "total_species_count",
+    ]
+    empty = pd.DataFrame({"measure": measures, "value": [pd.NA] * len(measures)})
+
+    if all_species_df is None or all_species_df.empty:
+        return empty
+
+    counts = _species_abundance_counts(all_species_df)
+    richness = int(len(counts))
+    shannon = exponential_shannon_index(counts) if richness else float("nan")
+    simpson = inverse_simpson_index(counts) if richness else float("nan")
+
+    per_species = _species_tag_frame(all_species_df)
+    if per_species.empty:
+        return empty
+
+    rli = red_list_index(per_species["iucn_redlist_status"])
+    assessed = sum(
+        1
+        for status in per_species["iucn_redlist_status"]
+        if RLI_CATEGORY_WEIGHTS.get(_normalise_iucn_status(status)) is not None
+    )
+    invasive_names = (
+        per_species.loc[per_species["is_invasive"], "species"]
+        .astype(str)
+        .sort_values()
+        .tolist()
+    )
+    n_invasive = len(invasive_names)
+    percent_invasive = (100.0 * n_invasive / richness) if richness else float("nan")
+
+    values = {
+        "observed_richness": richness,
+        "exponential_shannon": round(shannon, 6) if shannon == shannon else pd.NA,
+        "inverse_simpson": round(simpson, 6) if simpson == simpson else pd.NA,
+        "red_list_index": round(rli, 6) if rli == rli else pd.NA,
+        "percent_invasive": round(percent_invasive, 4) if percent_invasive == percent_invasive else pd.NA,
+        "invasive_species_count": n_invasive,
+        "invasive_species": ", ".join(invasive_names) if invasive_names else "",
+        "assessed_species_count": assessed,
+        "total_species_count": richness,
+    }
+    return pd.DataFrame({"measure": list(values.keys()), "value": list(values.values())})
+
+
 def save_all_tables(
     bundle: ObservationBundle,
     output_dir: str | Path,
@@ -488,8 +814,20 @@ def save_all_tables(
     out.mkdir(parents=True, exist_ok=True)
     prefix = f"{filename_prefix}_" if filename_prefix else ""
 
+    edna_df = bundle.edna if bundle.edna is not None else pd.DataFrame()
+    observation_counts = {
+        "camera": int(len(bundle.camera)),
+        "bioacoustic": int(len(bundle.bioacoustic)),
+        "edna": int(len(edna_df)),
+    }
     tables = {
-        "sensor_summary": (f"{prefix}sensor_summary.csv", station_summary_table(bundle.stations)),
+        "sensor_summary": (
+            f"{prefix}sensor_summary.csv",
+            station_summary_table(
+                bundle.stations,
+                observation_counts=observation_counts,
+            ),
+        ),
         "redlist_status": (f"{prefix}redlist_status_table.csv", redlist_status_table(bundle.all_species)),
         "major_concern_species": (
             f"{prefix}major_concern_species_table.csv",
@@ -501,6 +839,14 @@ def save_all_tables(
                 bundle.camera if "camera" in bundle.sensor_types else pd.DataFrame(),
                 bundle.bioacoustic if "bioacoustic" in bundle.sensor_types else pd.DataFrame(),
             ),
+        ),
+        "species_measures": (
+            f"{prefix}species_measures_table.csv",
+            species_measures_table(bundle.all_species),
+        ),
+        "invasive_species": (
+            f"{prefix}invasive_species_table.csv",
+            invasive_species_table(bundle.all_species),
         ),
     }
 

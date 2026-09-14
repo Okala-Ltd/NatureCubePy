@@ -68,9 +68,20 @@ PANEL_MUTED = "#A9C6BE"
 CLASS_COLORS = {
     "Mammalia": "#304E4F",
     "Aves": "#DDA0DD",
+    "Amphibia": "#67ECB5",
     "Reptilia": "#F5F5DC",
+    "Actinopterygii": "#45546A",
     "Insecta": "#76EEC6",
+    "Unknown": "#C7C7C7",
 }
+
+_METHOD_PLOT_LABELS = {
+    "camera": "Camera traps",
+    "bioacoustic": "Bioacoustics",
+    "edna": "eDNA",
+}
+
+_METHOD_PLOT_ORDER = ("camera", "bioacoustic", "edna")
 
 IUCN_COLOR_MAP = {
         "Extinct": "#000000",
@@ -798,7 +809,7 @@ def _default_logo_path() -> Path | None:
 
 
 def _load_okala_logo(logo_path: str | Path | None) -> np.ndarray | None:
-    """Load Okala lockup as RGBA (dark logo for light/white sidebars)."""
+    """Load Okala lockup as RGBA (mint logo for dark legend panels)."""
     if logo_path is None:
         logo_path = _default_logo_path()
     if logo_path is None:
@@ -815,6 +826,26 @@ def _load_okala_logo(logo_path: str | Path | None) -> np.ndarray | None:
         return None
 
 
+# Maps wider than this (data span_x / span_y) put the legend under the map.
+_WIDE_MAP_ASPECT = 1.55
+
+
+def _station_map_legend_layout(span_x: float, span_y: float) -> str:
+    """Choose ``side`` or ``bottom`` legend placement from the map data aspect."""
+    if span_y <= 0:
+        return "side"
+    return "bottom" if (span_x / span_y) >= _WIDE_MAP_ASPECT else "side"
+
+
+def _map_meta_lines() -> list[str]:
+    return [
+        "Coordinate system: EPSG:3857",
+        "Basemap: Esri World Imagery",
+        "Data: Okala / NatureCube",
+        f"Date: {date.today().strftime('%b %Y')}",
+    ]
+
+
 def _draw_station_map_sidebar(
     ax,
     *,
@@ -827,7 +858,7 @@ def _draw_station_map_sidebar(
     panel_top: float = 1.0,
     panel_bottom: float = 0.0,
 ) -> None:
-    """Legend panel on the Okala dark ground, aligned to the map frame.
+    """Vertical legend panel on the Okala dark ground, aligned to the map frame.
 
     ``panel_top``/``panel_bottom`` are the map frame edges in this axes'
     fraction coordinates; the panel grows downwards if its content needs more
@@ -848,12 +879,7 @@ def _draw_station_map_sidebar(
         img_h, img_w = logo_rgba.shape[:2]
         logo_h = (logo_w / fx) * (img_h / img_w) * fy
 
-    meta_lines = [
-        "Coordinate system: EPSG:3857",
-        "Basemap: Esri World Imagery",
-        "Data: Okala / NatureCube",
-        f"Date: {date.today().strftime('%b %Y')}",
-    ]
+    meta_lines = _map_meta_lines()
     meta_h = len(meta_lines) * 0.19 * fy
 
     scale_h = 0.075 * fy * 1.5 + 0.14 * fy + 0.50 * fy
@@ -955,6 +981,138 @@ def _draw_station_map_sidebar(
         meta_y += 0.19 * fy
 
 
+def _draw_station_map_footer(
+    ax,
+    *,
+    types_present: list[str],
+    color_map: dict[str, object],
+    has_boundary: bool,
+    logo_rgba: np.ndarray | None,
+    title: str = "Legend",
+    map_ax=None,
+    panel_left: float = 0.0,
+    panel_right: float = 1.0,
+) -> None:
+    """Horizontal legend strip under a wide map, aligned to the map frame.
+
+    ``panel_left``/``panel_right`` are the map frame edges in this axes'
+    fraction coordinates. Content is laid out left-to-right: logo, legend,
+    record-count key, scale/north, then source metadata.
+    """
+    ax.set_xlim(0, 1)
+    ax.set_ylim(0, 1)
+    ax.axis("off")
+    fx, fy = _axes_frac_per_inch(ax)
+
+    left = max(0.0, min(panel_left, panel_right))
+    right = min(1.0, max(panel_left, panel_right))
+    width = max(right - left, 0.2)
+    pad_x = 0.12 * fx
+    pad_y = 0.14 * fy
+    top = 1.0 - pad_y
+    bottom = pad_y
+
+    ax.add_patch(
+        Rectangle(
+            (left, 0.0),
+            width,
+            1.0,
+            facecolor=PANEL_BG,
+            edgecolor="none",
+            zorder=0,
+            clip_on=False,
+        )
+    )
+
+    x = left + pad_x
+    chip_w = 0.18 * fx
+    row_h = 0.22 * fy
+    mid_y = 0.52
+
+    # Logo on the left.
+    if logo_rgba is not None:
+        img_h, img_w = logo_rgba.shape[:2]
+        logo_w = min(1.55 * fx, width * 0.18)
+        logo_h = (logo_w / fx) * (img_h / img_w) * fy
+        logo_h = min(logo_h, top - bottom - 0.04)
+        logo_y0 = mid_y - logo_h / 2
+        ax.imshow(
+            logo_rgba,
+            extent=(x, x + logo_w, logo_y0, logo_y0 + logo_h),
+            aspect="auto",
+            zorder=2,
+            interpolation="bilinear",
+        )
+        x += logo_w + 0.18 * fx
+        ax.plot([x, x], [bottom + 0.06, top - 0.06], color=PANEL_TEXT, alpha=0.25, linewidth=0.8, zorder=1)
+        x += 0.12 * fx
+
+    # Legend keys.
+    y = top - 0.02
+    ax.text(x, y, title, fontsize=12, fontweight="bold", color=PANEL_TEXT, va="top", fontfamily="DejaVu Sans")
+    y -= 0.34 * fy
+    label_x = x + chip_w + 0.04
+    if has_boundary:
+        ax.plot([x, x + chip_w], [y, y], color=PANEL_TEXT, linewidth=2.2, solid_capstyle="butt", zorder=3)
+        ax.text(label_x, y, "Project boundary", fontsize=8, color=PANEL_TEXT, va="center")
+        y -= row_h
+    for sensor in types_present:
+        color = color_map.get(sensor, LOGO_MINT)
+        ax.scatter([x + chip_w / 2], [y], s=52, c=[color], edgecolors="#1f2933", linewidths=0.8, zorder=3)
+        ax.text(label_x, y, str(sensor), fontsize=8, color=PANEL_TEXT, va="center")
+        y -= row_h
+    legend_right = x + 1.55 * fx
+    x = legend_right + 0.14 * fx
+    ax.plot([x, x], [bottom + 0.06, top - 0.06], color=PANEL_TEXT, alpha=0.25, linewidth=0.8, zorder=1)
+    x += 0.12 * fx
+
+    # Record-count key.
+    y = top - 0.02
+    ax.text(x, y, "Record count", fontsize=9, fontweight="bold", color=PANEL_ACCENT, va="top")
+    y -= 0.34 * fy
+    label_x = x + chip_w + 0.04
+    for size, label in [(18, "Low"), (48, "Medium"), (95, "High")]:
+        ax.scatter([x + chip_w / 2], [y], s=size, c=[LOGO_MINT], edgecolors="#1f2933", linewidths=0.7, zorder=3)
+        ax.text(label_x, y, label, fontsize=8, color=PANEL_TEXT, va="center")
+        y -= row_h
+    x += 1.15 * fx + 0.14 * fx
+    ax.plot([x, x], [bottom + 0.06, top - 0.06], color=PANEL_TEXT, alpha=0.25, linewidth=0.8, zorder=1)
+    x += 0.12 * fx
+
+    # Scale bar + north arrow.
+    if map_ax is not None:
+        bar_w, bar_h = _draw_scalebar(
+            ax,
+            map_ax,
+            x=x,
+            y=bottom + 0.10,
+            max_width=min(2.2 * fx, right - x - 1.8 * fx),
+            color=PANEL_TEXT,
+            background=PANEL_BG,
+        )
+        if bar_w > 0:
+            _draw_north_arrow(
+                ax,
+                x=x + bar_w / 2,
+                y=bottom + 0.10 + bar_h * 1.5 + 0.10 * fy,
+                color=PANEL_TEXT,
+                background=PANEL_BG,
+            )
+            x += max(bar_w, 1.4 * fx) + 0.18 * fx
+        else:
+            x += 1.6 * fx
+    else:
+        x += 1.6 * fx
+
+    # Metadata on the far right of the strip.
+    meta_lines = _map_meta_lines()
+    meta_x = min(x, right - pad_x - 2.0 * fx)
+    meta_y = top - 0.02
+    for line in meta_lines:
+        ax.text(meta_x, meta_y, line, fontsize=7, color=PANEL_MUTED, va="top")
+        meta_y -= 0.18 * fy
+
+
 def station_map(
     stations: pd.DataFrame | gpd.GeoDataFrame,
     measurement_type: str = "all",
@@ -969,8 +1127,11 @@ def station_map(
     and a legend panel on the Okala dark ground carrying the mint lockup,
     sensor keys, north arrow, segmented scale bar, and source metadata.
 
-    ``logo_path`` defaults to the Okala lockup bundled with the package; pass a
-    path to override it.
+    Wide maps (data aspect ≥ ``_WIDE_MAP_ASPECT``) place the legend under the
+    map; otherwise the legend sits in a right-hand sidebar.
+
+    ``logo_path`` defaults to the mint Okala lockup bundled with the package;
+    pass a path to override it.
     """
     def _no_stations_figure():
         fig, ax = plt.subplots(figsize=(10, 7), facecolor=PANEL_BG)
@@ -1031,13 +1192,6 @@ def station_map(
         if boundary_gdf.empty:
             boundary_gdf = None
 
-    fig = plt.figure(figsize=(11.5, 8.0), facecolor=PANEL_BG)
-    # wspace leaves room for the map's right-hand latitude labels, which are
-    # drawn outside the map frame and would otherwise run into the legend.
-    gs = GridSpec(1, 2, width_ratios=[3.05, 1.0], wspace=0.12, left=0.06, right=0.98, top=0.94, bottom=0.08)
-    ax = fig.add_subplot(gs[0, 0])
-    ax_leg = fig.add_subplot(gs[0, 1])
-
     minx, miny, maxx, maxy = gdf_plot.total_bounds
     if boundary_gdf is not None:
         bminx, bminy, bmaxx, bmaxy = boundary_gdf.total_bounds
@@ -1051,6 +1205,48 @@ def station_map(
     span_y = max(maxy - miny, 1.0)
     pad_x = span_x * 0.08
     pad_y = span_y * 0.08
+    # Padded extent drives both the axes limits and the figure aspect so
+    # equal-aspect drawing fills the map slot instead of letterboxing a gap.
+    view_w = span_x + 2 * pad_x
+    view_h = span_y + 2 * pad_y
+    layout = _station_map_legend_layout(span_x, span_y)
+
+    if layout == "bottom":
+        fig_w = 12.0
+        margin_l, margin_r = 0.07, 0.07
+        map_w_in = fig_w * (1.0 - margin_l - margin_r)
+        map_h_in = map_w_in * (view_h / view_w)
+        footer_in = 1.05
+        # Space for bottom lon labels between the map frame and the footer.
+        label_gap_in = 0.28
+        top_in = 0.32
+        bot_in = 0.0
+        fig_h = float(np.clip(top_in + map_h_in + label_gap_in + footer_in + bot_in, 4.5, 12.0))
+        fig = plt.figure(figsize=(fig_w, fig_h), facecolor=PANEL_BG)
+        ax = fig.add_axes(
+            [margin_l, (bot_in + footer_in + label_gap_in) / fig_h, 1.0 - margin_l - margin_r, map_h_in / fig_h]
+        )
+        # Full-bleed footer strip: edge to edge of the figure.
+        ax_leg = fig.add_axes(
+            [0.0, bot_in / fig_h, 1.0, footer_in / fig_h]
+        )
+    else:
+        fig = plt.figure(figsize=(11.5, 8.0), facecolor=PANEL_BG)
+        # wspace leaves room for the map's right-hand latitude labels, which are
+        # drawn outside the map frame and would otherwise run into the legend.
+        gs = GridSpec(
+            1,
+            2,
+            width_ratios=[3.05, 1.0],
+            wspace=0.12,
+            left=0.06,
+            right=0.98,
+            top=0.94,
+            bottom=0.08,
+        )
+        ax = fig.add_subplot(gs[0, 0])
+        ax_leg = fig.add_subplot(gs[0, 1])
+
     ax.set_xlim(minx - pad_x, maxx + pad_x)
     ax.set_ylim(miny - pad_y, maxy + pad_y)
 
@@ -1091,28 +1287,62 @@ def station_map(
     ax.set_xticks([])
     ax.set_yticks([])
 
-    # Equal aspect shrinks the map axes to fit its data, so the frame's real
-    # position is only known after a draw. Resolve it before laying out the
-    # panel so the panel edges line up with the map frame.
+    # Equal aspect can still nudge the map frame; resolve positions after a
+    # draw so the legend panel lines up with the drawn map edges.
     fig.canvas.draw()
     map_pos = ax.get_position()
     leg_pos = ax_leg.get_position()
 
+    if layout == "bottom":
+        # Keep the footer full-bleed left/right; only nudge its vertical band
+        # up under the drawn map frame (room for lon labels).
+        fig_h = fig.get_size_inches()[1]
+        label_gap = 0.28 / fig_h
+        footer_h = min(leg_pos.height, 1.05 / fig_h)
+        new_y1 = map_pos.y0 - label_gap
+        new_y0 = max(0.0, new_y1 - footer_h)
+        ax_leg.set_position([0.0, new_y0, 1.0, new_y1 - new_y0])
+        leg_pos = ax_leg.get_position()
+        # Content insets align with the map frame inside the full-width bar.
+        content_left = map_pos.x0 / max(leg_pos.width, 1e-6)
+        content_right = map_pos.x1 / max(leg_pos.width, 1e-6)
+    else:
+        content_left = 0.0
+        content_right = 1.0
+
     logo_rgba = _load_okala_logo(logo_path)
-    _draw_station_map_sidebar(
-        ax_leg,
+    legend_kwargs = dict(
         types_present=types,
         color_map=color_map,
         has_boundary=boundary_gdf is not None,
         logo_rgba=logo_rgba,
         title="Legend",
         map_ax=ax,
-        panel_top=(map_pos.y1 - leg_pos.y0) / leg_pos.height,
-        panel_bottom=(map_pos.y0 - leg_pos.y0) / leg_pos.height,
     )
+    if layout == "bottom":
+        _draw_station_map_footer(
+            ax_leg,
+            panel_left=content_left,
+            panel_right=content_right,
+            **legend_kwargs,
+        )
+    else:
+        _draw_station_map_sidebar(
+            ax_leg,
+            panel_top=(map_pos.y1 - leg_pos.y0) / leg_pos.height,
+            panel_bottom=(map_pos.y0 - leg_pos.y0) / leg_pos.height,
+            **legend_kwargs,
+        )
 
     if output_path is not None:
-        fig.savefig(output_path, dpi=300, bbox_inches="tight", pad_inches=0.15, facecolor=fig.get_facecolor())
+        fig.savefig(
+            output_path,
+            dpi=300,
+            bbox_inches="tight",
+            pad_inches=0.05,
+            facecolor=fig.get_facecolor(),
+            edgecolor="none",
+        )
 
     return fig
 
@@ -1814,11 +2044,23 @@ def camera_activity_timeline(
 # ---------------------------------------------------------------------------
 # Species Records
 # ---------------------------------------------------------------------------
-def _class_record_species_counts(df: pd.DataFrame) -> pd.DataFrame:
+def _class_record_species_counts(
+    df: pd.DataFrame,
+    *,
+    species_detections_only: bool = False,
+) -> pd.DataFrame:
     work = pd.DataFrame({
         "class": _taxonomic_class_series(df),
         "species": _species_series(df),
     })
+
+    if species_detections_only:
+        # Species-level detections only: drop blank taxa and Unknown class.
+        class_key = work["class"].astype(str).str.strip().str.lower()
+        work = work.loc[
+            work["species"].ne("")
+            & ~class_key.isin({"", "unknown", "nan", "none", "null"})
+        ].copy()
 
     records = (
         work.groupby("class")
@@ -1981,6 +2223,160 @@ def records_per_class(
         wspace=0.32,
     )
 
+    return fig
+
+
+def records_species_by_monitoring_type(
+    observations_by_method: dict[str, pd.DataFrame],
+    *,
+    class_colors: dict[str, object] = CLASS_COLORS,
+    font_family: str = "Arial",
+    figsize: tuple[float, float] = (10.0, 3.8),
+    x_label_rotation: float = 20.0,
+    dpi: float = 200.0,
+):
+    """Stacked bar charts of records/species by monitoring type and class.
+
+    Panel A: number of species-level detection records per monitoring type,
+    stacked by taxonomic class (Unknown / unnamed detections excluded).
+    Panel B: number of named species per monitoring type, stacked by class.
+    """
+    method_keys = [
+        key
+        for key in _METHOD_PLOT_ORDER
+        if key in observations_by_method
+        and observations_by_method[key] is not None
+        and not observations_by_method[key].empty
+    ]
+    # Preserve any unexpected method keys after the standard order.
+    for key, frame in observations_by_method.items():
+        if key in method_keys:
+            continue
+        if frame is None or frame.empty:
+            continue
+        method_keys.append(key)
+
+    if not method_keys:
+        return _empty_figure("No monitoring data available", figsize=figsize)
+
+    per_method: dict[str, pd.DataFrame] = {}
+    all_classes: set[str] = set()
+    for key in method_keys:
+        counts = _class_record_species_counts(
+            observations_by_method[key],
+            species_detections_only=True,
+        )
+        if counts.empty:
+            continue
+        per_method[key] = counts.set_index("class")
+        all_classes.update(per_method[key].index.astype(str).tolist())
+
+    if not per_method:
+        return _empty_figure("No class data available", figsize=figsize)
+
+    def _class_rank(name: str) -> tuple[int, str]:
+        lower = str(name).strip().lower()
+        if any(token in lower for token in ["mammalia", "mammal"]):
+            return (0, lower)
+        if any(token in lower for token in ["aves", "bird", "avian"]):
+            return (1, lower)
+        if "amphibia" in lower or "amphibian" in lower:
+            return (2, lower)
+        if "reptilia" in lower or "reptile" in lower:
+            return (3, lower)
+        if "actinopterygii" in lower or "fish" in lower:
+            return (4, lower)
+        if lower in {"", "unknown"}:
+            return (99, lower)
+        return (50, lower)
+
+    class_levels = sorted(all_classes, key=_class_rank)
+    method_labels = [
+        _METHOD_PLOT_LABELS.get(key, key.replace("_", " ").title()) for key in per_method
+    ]
+    x = np.arange(len(method_labels))
+
+    panels = (
+        ("number_of_records", "Number of records", "A"),
+        ("number_of_species", "Number of species", "B"),
+    )
+
+    fig, axes = plt.subplots(
+        ncols=2,
+        figsize=figsize,
+        dpi=dpi,
+        squeeze=False,
+        facecolor="white",
+    )
+    axes = axes.flatten()
+
+    legend_handles = []
+    legend_labels = []
+    for ax, (column, ylabel, letter) in zip(axes, panels):
+        bottoms = np.zeros(len(method_labels), dtype=float)
+        totals = np.zeros(len(method_labels), dtype=float)
+        for class_name in class_levels:
+            heights = np.array(
+                [
+                    float(per_method[key][column].get(class_name, 0))
+                    if class_name in per_method[key].index
+                    else 0.0
+                    for key in per_method
+                ],
+                dtype=float,
+            )
+            if not np.any(heights > 0):
+                continue
+            color = class_colors.get(class_name, "#999999")
+            bars = ax.bar(
+                x,
+                heights,
+                bottom=bottoms,
+                color=color,
+                edgecolor="#333333",
+                linewidth=0.6,
+                clip_on=False,
+                label=class_name,
+            )
+            bottoms = bottoms + heights
+            totals = totals + heights
+            if class_name not in legend_labels:
+                legend_handles.append(bars[0])
+                legend_labels.append(class_name)
+
+        ax.set_xticks(x)
+        ax.set_xticklabels(method_labels)
+        _style_class_axis(
+            ax,
+            values=totals,
+            y_label=ylabel,
+            panel_letter=letter,
+            font_family=font_family,
+            x_label_rotation=x_label_rotation,
+        )
+        for lbl in ax.get_xticklabels():
+            lbl.set_ha("center")
+            lbl.set_rotation(0)
+
+    if legend_handles:
+        axes[1].legend(
+            legend_handles,
+            legend_labels,
+            title="Class",
+            loc="upper left",
+            bbox_to_anchor=(1.02, 1.0),
+            frameon=False,
+            fontsize=8,
+            title_fontsize=9,
+        )
+
+    fig.subplots_adjust(
+        left=0.08,
+        right=0.86,
+        bottom=0.16,
+        top=0.94,
+        wspace=0.32,
+    )
     return fig
 
 
@@ -2603,28 +2999,30 @@ def _edna_class_rank_summary(
 
     if rank_source is None:
         # Derive lowest identification rank when explicit rank column is not present.
-        for rank_name, cols in [
-            ("Species", ["taxon_name", "Species", "species", "label"]),
-            ("Genus", ["Genus", "genus"]),
-            ("Family", ["Family", "family"]),
-            ("Order", ["Order", "order"]),
-        ]:
-            existing = [c for c in cols if c in work.columns]
-            if not existing:
-                continue
+        # Apply coarse → fine so the finest filled taxonomy field wins.
+        # Do not treat ``label`` alone as species: eDNA labels are often genus /
+        # family / order names when ``species`` is blank.
+        def _filled(cols: list[str]) -> pd.Series:
             values = pd.Series([""] * len(work), index=work.index, dtype="object")
-            for c in existing:
+            for c in cols:
+                if c not in work.columns:
+                    continue
                 vals = work[c].fillna("").astype(str).str.strip()
                 values = values.mask(values == "", vals)
-            if rank_name == "Species":
-                mask = values != ""
-                resolved_rank.loc[mask] = "Species"
-            elif rank_name == "Genus":
-                mask = (resolved_rank == "Order") & (values != "")
-                resolved_rank.loc[mask] = "Genus"
-            elif rank_name == "Family":
-                mask = (resolved_rank == "Order") & (values != "")
-                resolved_rank.loc[mask] = "Family"
+            return values != ""
+
+        has_family = _filled(["Family", "family"])
+        has_genus = _filled(["Genus", "genus"])
+        has_species = _filled(["taxon_name", "Species", "species"])
+        if "label" in work.columns:
+            # Free-text labels may be binomials even when ``species`` is absent.
+            labels = work["label"].fillna("").astype(str).str.strip()
+            binomial = labels.str.contains(r"\s+", regex=True) & (labels != "")
+            has_species = has_species | binomial
+
+        resolved_rank.loc[has_family] = "Family"
+        resolved_rank.loc[has_genus] = "Genus"
+        resolved_rank.loc[has_species] = "Species"
 
     if taxon_col and taxon_col in work.columns:
         resolved_taxon = work[taxon_col].fillna("").astype(str).str.strip()
@@ -3334,21 +3732,43 @@ def save_all_figures(
             continue
         _save(key, fig)
 
-    class_levels = _ordered_class_levels(
-        bundle.camera if "camera" in selected else pd.DataFrame(),
-        bundle.bioacoustic if "bioacoustic" in selected else pd.DataFrame(),
-    )
-    class_specs = []
-    if "camera" in selected:
-        class_specs.append(("species_per_class_camera", bundle.camera, "camera"))
-    if "bioacoustic" in selected:
-        class_specs.append(("species_per_class_bioacoustic", bundle.bioacoustic, "bioacoustic"))
-    for key, frame, label in class_specs:
-        if frame is None or frame.empty:
-            _skip(key, f"no {label} observation data for class figure")
-            continue
-        fig = records_per_class(frame, class_levels=class_levels or ["Unknown"], class_colors=CLASS_COLORS)
-        _save(key, fig)
+    method_frames: dict[str, pd.DataFrame] = {}
+    if "camera" in selected and bundle.camera is not None and not bundle.camera.empty:
+        method_frames["camera"] = bundle.camera
+    if (
+        "bioacoustic" in selected
+        and bundle.bioacoustic is not None
+        and not bundle.bioacoustic.empty
+    ):
+        method_frames["bioacoustic"] = bundle.bioacoustic
+    if "edna" in selected:
+        if bundle.edna is not None and not bundle.edna.empty:
+            method_frames["edna"] = bundle.edna
+        elif "measurement_type" in bundle.all_species.columns:
+            edna_from_all = bundle.all_species[
+                bundle.all_species["measurement_type"].map(_canonical_measurement_type)
+                == "eDNA"
+            ]
+            if not edna_from_all.empty:
+                method_frames["edna"] = edna_from_all
+
+    # Replace legacy per-sensor class figures with one stacked monitoring-type figure.
+    for legacy_key in ("species_per_class_camera", "species_per_class_bioacoustic"):
+        legacy_path = _path(legacy_key)
+        if legacy_path.exists():
+            print(f"Warning: removing stale figure '{legacy_key}' (replaced by species_per_method).")
+            legacy_path.unlink()
+
+    if method_frames:
+        _save(
+            "species_per_method",
+            records_species_by_monitoring_type(
+                method_frames,
+                class_colors=CLASS_COLORS,
+            ),
+        )
+    else:
+        _skip("species_per_method", "no observation data for monitoring-type figure")
 
     if "camera" in selected or "bioacoustic" in selected:
         cam_obs = bundle.camera if "camera" in selected else pd.DataFrame()
@@ -3417,14 +3837,12 @@ def save_all_figures(
         "camera": (
             "camera_sampling_locations",
             "timeline_camera_trap_activity",
-            "species_per_class_camera",
             "species_accumulation_mammal_bird_camera",
             "top_mammal_bird_species_camera",
         ),
         "bioacoustic": (
             "bioacoustic_sampling_locations",
             "timeline_bioacoustic_activity",
-            "species_per_class_bioacoustic",
             "species_accumulation_mammal_bird_bioacoustic",
             "top_mammal_bird_species_bioacoustic",
         ),

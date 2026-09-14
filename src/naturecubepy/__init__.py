@@ -90,9 +90,11 @@ from naturecubepy.analysis import (
     ObservationBundle,
     ProjectAssetExport,
     export_project_assets,
+    invasive_species_table,
     load_project_data,
     save_all_tables,
     save_observation_bundle,
+    species_measures_table,
 )
 
 
@@ -171,5 +173,7 @@ __all__ = [
     "load_project_data",
     "save_observation_bundle",
     "save_all_tables",
+    "species_measures_table",
+    "invasive_species_table",
     "export_project_assets",
 ]
