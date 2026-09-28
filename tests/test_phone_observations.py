@@ -485,6 +485,46 @@ class TestGetPhoneObservationData:
                 hdr, procedure_id=7, data_type="instruction", project_id=42
             )
 
+    def test_passes_start_and_end_time_as_query_params(self, hdr):
+        page = MagicMock()
+        page.status_code = 200
+        page.headers = {"content-type": "text/csv"}
+        page.raise_for_status = MagicMock()
+        page.content = b"observation_id,item_name,data_type,data\n11,Notes,text,hi\n"
+
+        start = datetime(2026, 4, 1, tzinfo=timezone.utc)
+        end = datetime(2026, 4, 1, 23, 59, 59, tzinfo=timezone.utc)
+
+        with patch(
+            "naturecubepy.phone_observations.httpx.get",
+            return_value=page,
+        ) as get:
+            result = get_phone_observation_data(
+                hdr,
+                procedure_id=7,
+                data_type="text",
+                project_id=42,
+                start_time=start,
+                end_time=end,
+            )
+
+        assert list(result["observation_id"]) == [11]
+        params = get.call_args.kwargs["params"]
+        assert params["start_time"] == "2026-04-01T00:00:00Z"
+        assert params["end_time"] == "2026-04-01T23:59:59Z"
+        assert params["limit"] == 1000
+
+    def test_rejects_start_time_after_end_time(self, hdr):
+        with pytest.raises(ValueError, match="start_time must be less than or equal"):
+            get_phone_observation_data(
+                hdr,
+                procedure_id=7,
+                data_type="text",
+                project_id=42,
+                start_time=datetime(2026, 4, 2, tzinfo=timezone.utc),
+                end_time=datetime(2026, 4, 1, tzinfo=timezone.utc),
+            )
+
     def test_media_export_reads_csv_from_zip(self, hdr, tmp_path):
         import io
         from zipfile import ZipFile, ZIP_DEFLATED

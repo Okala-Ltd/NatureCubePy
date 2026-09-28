@@ -1217,7 +1217,7 @@ def _phone_retry_after_seconds(response: httpx.Response, attempt: int) -> float:
 def _get_phone_observation_page(
     url: str,
     *,
-    params: dict[str, int],
+    params: dict[str, Any],
     timeout: float,
 ) -> httpx.Response:
     """GET one export page, retrying on HTTP 429."""
@@ -1243,6 +1243,8 @@ def _iter_phone_observation_pages(
     page_size: int,
     timeout: float,
     media_dir: Path | None = None,
+    start_time: datetime | None = None,
+    end_time: datetime | None = None,
 ) -> list[pd.DataFrame]:
     """Fetch all pages for one data_type via keyset pagination."""
     url = _phone_observations_url(hdr, project_id, procedure_id, data_type)
@@ -1250,9 +1252,17 @@ def _iter_phone_observation_pages(
     after_observation_id: int | None = None
     seen_cursors: set[int] = set()
     total_reported: int | None = None
+    time_params: dict[str, str] = {}
+    if start_time is not None:
+        time_params["start_time"] = _format_dt(start_time)
+    if end_time is not None:
+        time_params["end_time"] = _format_dt(end_time)
 
     while True:
-        params: dict[str, int] = {"limit": min(int(page_size), _PHONE_PAGE_SIZE)}
+        params: dict[str, Any] = {
+            "limit": min(int(page_size), _PHONE_PAGE_SIZE),
+            **time_params,
+        }
         if after_observation_id is not None:
             params["after_observation_id"] = after_observation_id
         else:
@@ -1380,6 +1390,8 @@ def get_phone_observation_data(
     data_type: PhoneObservationExportType | list[PhoneObservationExportType] | str = "all",
     *,
     project_id: int | None = None,
+    start_time: datetime | None = None,
+    end_time: datetime | None = None,
     page_size: int = _PHONE_PAGE_SIZE,
     timeout: float = _PHONE_PAGE_TIMEOUT,
     media_dir: str | Path | None = None,
@@ -1406,6 +1418,11 @@ def get_phone_observation_data(
     project_id:
         Optional project ID. When omitted, resolved automatically from the API
         key via ``GET /getProject/{api_key}``.
+    start_time:
+        Optional inclusive lower bound on observation ``recorded_at`` (UTC).
+    end_time:
+        Optional inclusive upper bound on observation ``recorded_at`` (UTC).
+        Use with ``start_time`` to download a single day or range.
     page_size:
         Rows per request (max 1000).
     timeout:
@@ -1433,11 +1450,23 @@ def get_phone_observation_data(
     >>> df = get_phone_observation_data(hdr, procedure_id=7, data_type="label")  # doctest: +SKIP
     >>> wide = get_phone_observation_data(hdr, procedure_id=7, wide=True)  # doctest: +SKIP
     >>> all_procs = get_phone_observation_data(hdr, procedure_id="all", wide=True)  # doctest: +SKIP
+    >>> day = get_phone_observation_data(  # doctest: +SKIP
+    ...     hdr,
+    ...     procedure_id=7,
+    ...     start_time=datetime(2026, 4, 1, tzinfo=timezone.utc),
+    ...     end_time=datetime(2026, 4, 1, 23, 59, 59, tzinfo=timezone.utc),
+    ... )
     """
     project_id = _resolve_project_id(hdr, project_id, timeout=timeout)
     procedure_ids = _resolve_procedure_ids(hdr, procedure_id, timeout=timeout)
     if page_size < 1:
         raise ValueError("page_size must be >= 1.")
+    if (
+        start_time is not None
+        and end_time is not None
+        and start_time > end_time
+    ):
+        raise ValueError("start_time must be less than or equal to end_time.")
 
     types = _normalise_phone_export_types(data_type)
     out_dir = Path(media_dir) if media_dir is not None else None
@@ -1460,6 +1489,8 @@ def get_phone_observation_data(
                     page_size=page_size,
                     timeout=timeout,
                     media_dir=type_media_dir,
+                    start_time=start_time,
+                    end_time=end_time,
                 )
             except httpx.HTTPStatusError as exc:
                 if exc.response is not None and exc.response.status_code == 404:
