@@ -35,17 +35,28 @@ SegmentVerificationStatuses = Literal[
     "labeller_verified", "manager_verified", "ai_derived"
 ]
 
-IUCNStatus = Literal[
-    "Data Deficient",
-    "Least Concern",
-    "Near Threatened",
-    "Vulnerable",
-    "Endangered",
-    "Critically Endangered",
-    "Extinct in the Wild",
-    "Extinct",
-    "Not Evaluated",
-]
+# Canonical Red List category names with abbreviations. Order is the
+# preferred stacking / legend order for species figures (least → most severe,
+# then unassessed categories). Leave unannotated so ``Literal[*...]`` keeps
+# the concrete string members for pydantic / type checkers.
+IUCN_CATEGORIES = (
+    ("Least Concern", "lc"),
+    ("Near Threatened", "nt"),
+    ("Vulnerable", "vu"),
+    ("Endangered", "en"),
+    ("Critically Endangered", "cr"),
+    ("Extinct in the Wild", "ew"),
+    ("Extinct", "ex"),
+    ("Data Deficient", "dd"),
+    ("Not Applicable", "na"),
+    ("Not Evaluated", "ne"),
+)
+IUCN_CATEGORY_ORDER = tuple(name for name, _ in IUCN_CATEGORIES)
+IUCN_CATEGORY_BY_KEY = {
+    **{name.lower(): name for name, _ in IUCN_CATEGORIES},
+    **{abbr: name for name, abbr in IUCN_CATEGORIES},
+}
+IUCNStatus = Literal[*IUCN_CATEGORY_ORDER]
 
 FileStatus = Literal["processed", "healthy", "corrupted", "quality_flagged"]
 
