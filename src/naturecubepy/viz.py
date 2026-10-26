@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import re
 import numpy as np
 
 import pandas as pd
@@ -26,6 +27,8 @@ from pyproj import Transformer
 from datetime import date
 from PIL import Image
 from shapely import wkt as shapely_wkt
+
+from naturecubepy.schema import IUCN_CATEGORY_BY_KEY, IUCN_CATEGORY_ORDER
 
 
 # ---------------------------------------------------------------------------
@@ -476,96 +479,6 @@ def make_size_scaler(values, min_size=50, max_size=400, pad=0.1):
         )
 
     return scale
-
-
-def load_stations(
-    stations: pd.DataFrame | gpd.GeoDataFrame,
-):
-    df = stations.copy()
-
-    # ---- Get coordinates ----
-    if isinstance(df, gpd.GeoDataFrame) and "geometry" in df.columns:
-        if df.crs and not df.crs.is_geographic:
-            points = df.to_crs(epsg=4326).geometry
-        else:
-            points = df.geometry
-
-        df["lat"] = points.y
-        df["lon"] = points.x
-
-    else:
-        lat_col = next(
-            (c for c in ["lat", "latitude", "Latitude"] if c in df.columns),
-            None,
-        )
-        lon_col = next(
-            (c for c in ["lon", "lng", "longitude", "Longitude"] if c in df.columns),
-            None,
-        )
-
-        if lat_col is not None and lon_col is not None:
-            df["lat"] = df[lat_col]
-            df["lon"] = df[lon_col]
-        elif "geometry" in df.columns:
-            geoms = []
-            for value in df["geometry"]:
-                if value is None or (isinstance(value, float) and pd.isna(value)):
-                    geoms.append(None)
-                    continue
-                if hasattr(value, "x") and hasattr(value, "y"):
-                    geoms.append(value)
-                    continue
-                try:
-                    geoms.append(shapely_wkt.loads(str(value)))
-                except Exception:
-                    geoms.append(None)
-            gdf = gpd.GeoDataFrame(df, geometry=geoms, crs="EPSG:4326")
-            gdf = gdf[gdf.geometry.notna()].copy()
-            df = gdf
-            df["lat"] = df.geometry.y
-            df["lon"] = df.geometry.x
-        else:
-            raise ValueError(
-                "Input must contain either a geometry column or latitude/longitude columns"
-            )
-
-    df = df.dropna(subset=["lat", "lon"]).reset_index(drop=True)
-
-    if df.empty:
-        raise ValueError("No valid station coordinates found")
-
-    return df
-
-
-def load_project_boundary(
-    project_boundary: str | Path | gpd.GeoDataFrame | None,
-    *,
-    target_crs: object,
-) -> gpd.GeoDataFrame | None:
-    if project_boundary is None:
-        return None
-
-    try:
-        if isinstance(project_boundary, gpd.GeoDataFrame):
-            boundary = project_boundary.copy()
-        else:
-            boundary = gpd.read_file(str(project_boundary))
-    except Exception as exc:
-        warnings.warn(f"Could not read project boundary; no boundary will be drawn. Original error: {exc}", stacklevel=2)
-        return None
-
-    if boundary.empty:
-        warnings.warn("Provided project boundary is empty; no boundary will be drawn.", stacklevel=2)
-        return None
-
-    if boundary.crs is None:
-        boundary = boundary.set_crs("EPSG:4326", allow_override=True)
-
-    try:
-        return boundary.to_crs(target_crs)
-    except Exception as exc:
-        warnings.warn(f"Could not reproject project boundary; no boundary will be drawn. Original error: {exc}", stacklevel=2)
-        return None 
 
 
 # ---------------------------------------------------------------------------
@@ -1111,6 +1024,135 @@ def _draw_station_map_footer(
     for line in meta_lines:
         ax.text(meta_x, meta_y, line, fontsize=7, color=PANEL_MUTED, va="top")
         meta_y -= 0.18 * fy
+
+
+def load_project_boundary(
+    project_boundary: str | Path | gpd.GeoDataFrame | None,
+    *,
+    target_crs: object,
+) -> gpd.GeoDataFrame | None:
+    """Load a project boundary from a file or GeoDataFrame and reproject it.
+
+    Parameters
+    ----------
+    project_boundary:
+        Path to a vector file, a GeoDataFrame (e.g. from
+        :func:`~naturecubepy.api.get_project_boundary`), or ``None``.
+    target_crs:
+        CRS to reproject the boundary into.
+
+    Returns
+    -------
+    geopandas.GeoDataFrame or None
+        The reprojected boundary, or ``None`` (with a warning) when it is
+        missing, empty, unreadable, or cannot be reprojected. A boundary
+        without a CRS is assumed to be EPSG:4326.
+    """
+    if project_boundary is None:
+        return None
+
+    try:
+        if isinstance(project_boundary, gpd.GeoDataFrame):
+            boundary = project_boundary.copy()
+        else:
+            boundary = gpd.read_file(str(project_boundary))
+    except Exception as exc:
+        warnings.warn(f"Could not read project boundary; no boundary will be drawn. Original error: {exc}", stacklevel=2)
+        return None
+
+    if boundary.empty:
+        warnings.warn("Provided project boundary is empty; no boundary will be drawn.", stacklevel=2)
+        return None
+
+    if boundary.crs is None:
+        boundary = boundary.set_crs("EPSG:4326", allow_override=True)
+
+    try:
+        return boundary.to_crs(target_crs)
+    except Exception as exc:
+        warnings.warn(f"Could not reproject project boundary; no boundary will be drawn. Original error: {exc}", stacklevel=2)
+        return None
+
+
+def load_stations(
+    stations: pd.DataFrame | gpd.GeoDataFrame,
+) -> pd.DataFrame | gpd.GeoDataFrame:
+    """Normalise station coordinates into ``lat`` / ``lon`` columns (EPSG:4326).
+
+    Coordinates are taken from, in order: a GeoDataFrame ``geometry`` column
+    (reprojected to EPSG:4326 if projected), latitude/longitude columns
+    (``lat``/``latitude``/``Latitude`` and ``lon``/``lng``/``longitude``/``Longitude``),
+    or a ``geometry`` column of shapely points or WKT strings.
+
+    Parameters
+    ----------
+    stations:
+        Station table, e.g. from :func:`~naturecubepy.api.get_station_info`.
+
+    Returns
+    -------
+    pandas.DataFrame or geopandas.GeoDataFrame
+        A copy of ``stations`` with ``lat`` and ``lon`` columns added and rows
+        without valid coordinates dropped.
+
+    Raises
+    ------
+    ValueError
+        If no coordinate columns are present or no valid coordinates remain.
+    """
+    df = stations.copy()
+
+    if isinstance(df, gpd.GeoDataFrame) and "geometry" in df.columns:
+        if df.crs and not df.crs.is_geographic:
+            points = df.to_crs(epsg=4326).geometry
+        else:
+            points = df.geometry
+
+        df["lat"] = points.y
+        df["lon"] = points.x
+
+    else:
+        lat_col = next(
+            (c for c in ["lat", "latitude", "Latitude"] if c in df.columns),
+            None,
+        )
+        lon_col = next(
+            (c for c in ["lon", "lng", "longitude", "Longitude"] if c in df.columns),
+            None,
+        )
+
+        if lat_col is not None and lon_col is not None:
+            df["lat"] = df[lat_col]
+            df["lon"] = df[lon_col]
+        elif "geometry" in df.columns:
+            geoms = []
+            for value in df["geometry"]:
+                if value is None or (isinstance(value, float) and pd.isna(value)):
+                    geoms.append(None)
+                    continue
+                if hasattr(value, "x") and hasattr(value, "y"):
+                    geoms.append(value)
+                    continue
+                try:
+                    geoms.append(shapely_wkt.loads(str(value)))
+                except Exception:
+                    geoms.append(None)
+            gdf = gpd.GeoDataFrame(df, geometry=geoms, crs="EPSG:4326")
+            gdf = gdf[gdf.geometry.notna()].copy()
+            df = gdf
+            df["lat"] = df.geometry.y
+            df["lon"] = df.geometry.x
+        else:
+            raise ValueError(
+                "Input must contain either a geometry column or latitude/longitude columns"
+            )
+
+    df = df.dropna(subset=["lat", "lon"]).reset_index(drop=True)
+
+    if df.empty:
+        raise ValueError("No valid station coordinates found")
+
+    return df
 
 
 def station_map(
@@ -3052,6 +3094,68 @@ def _edna_class_rank_summary(
     )
     return summary
 
+def _draw_stacked_class_bars(
+    ax,
+    pivot: pd.DataFrame,
+    colors: dict[str, str],
+    *,
+    ylabel: str,
+    legend_title: str,
+    font_family: str,
+    y_tick_step: int,
+    x_label_rotation: float,
+) -> None:
+    """Draw class-indexed stacked bars (columns = stack segments, bottom → top)."""
+    bottom = np.zeros(len(pivot), dtype=float)
+    for segment in pivot.columns:
+        values = pivot[segment].to_numpy(dtype=float)
+        ax.bar(
+            pivot.index,
+            values,
+            bottom=bottom,
+            color=colors.get(segment, "#bdbdbd"),
+            label=segment,
+            clip_on=False,
+        )
+        bottom += values
+
+    max_total = float(pivot.sum(axis=1).max()) if not pivot.empty else 0.0
+    y_max = int(np.ceil(max_total / float(y_tick_step)) * y_tick_step) if max_total > 0 else y_tick_step
+    # Small lower padding preserves the bottom bar edge without showing an x-axis baseline.
+    y_lower_pad = max(0.8, float(y_tick_step) * 0.04)
+    ax.set_ylim(-y_lower_pad, y_max)
+    ax.set_yticks(np.arange(0, y_max + 1, y_tick_step))
+    ax.spines["left"].set_bounds(0, y_max)
+
+    ax.set_ylabel(ylabel, fontfamily=font_family)
+    ax.set_xlabel("")
+    ax.spines["bottom"].set_visible(False)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    ax.tick_params(axis="x", length=0, rotation=x_label_rotation, labelsize=9)
+    ax.tick_params(axis="y", labelsize=9)
+    for label in ax.get_xticklabels():
+        label.set_ha("right")
+        label.set_rotation_mode("anchor")
+        label.set_fontfamily(font_family)
+    for label in ax.get_yticklabels():
+        label.set_fontfamily(font_family)
+
+    legend = ax.legend(
+        title=legend_title,
+        loc="upper right",
+        bbox_to_anchor=(0.98, 0.98),
+        frameon=False,
+        borderaxespad=0.0,
+        prop={"family": font_family, "size": 8.5},
+    )
+    if legend is not None and legend.get_title() is not None:
+        legend.get_title().set_fontfamily(font_family)
+        legend.get_title().set_fontsize(9)
+
+    ax.figure.subplots_adjust(left=0.12, right=0.98, bottom=0.2, top=0.96)
+
+
 def plot_edna_records(
     edna_df: pd.DataFrame,
     *,
@@ -3124,56 +3228,16 @@ def plot_edna_records(
     )
     pivot = pivot.loc[pivot.sum(axis=1).sort_values(ascending=False).index]
 
-    bottom = np.zeros(len(pivot), dtype=float)
-    for rank in pivot.columns:
-        values = pivot[rank].to_numpy(dtype=float)
-        ax.bar(
-            pivot.index,
-            values,
-            bottom=bottom,
-            color=colors_use.get(rank, "#bdbdbd"),
-            edgecolor="#333333",
-            linewidth=0.6,
-            label=rank,
-            clip_on=False,
-        )
-        bottom += values
-
-    max_total = float(pivot.sum(axis=1).max()) if not pivot.empty else 0.0
-    y_max = int(np.ceil(max_total / float(y_tick_step)) * y_tick_step) if max_total > 0 else y_tick_step
-    # Small lower padding preserves the bottom bar edge without showing an x-axis baseline.
-    y_lower_pad = max(0.8, float(y_tick_step) * 0.04)
-    ax.set_ylim(-y_lower_pad, y_max)
-    ax.set_yticks(np.arange(0, y_max + 1, y_tick_step))
-    ax.spines["left"].set_bounds(0, y_max)
-
-    ax.set_ylabel("Number of unique taxa", fontfamily=font_family)
-    ax.set_xlabel("")
-    ax.spines["bottom"].set_visible(False)
-    ax.spines["top"].set_visible(False)
-    ax.spines["right"].set_visible(False)
-    ax.tick_params(axis="x", length=0, rotation=x_label_rotation, labelsize=9)
-    ax.tick_params(axis="y", labelsize=9)
-    for label in ax.get_xticklabels():
-        label.set_ha("right")
-        label.set_rotation_mode("anchor")
-        label.set_fontfamily(font_family)
-    for label in ax.get_yticklabels():
-        label.set_fontfamily(font_family)
-
-    legend = ax.legend(
-        title=legend_title,
-        loc="upper right",
-        bbox_to_anchor=(0.98, 0.98),
-        frameon=False,
-        borderaxespad=0.0,
-        prop={"family": font_family, "size": 8.5},
+    _draw_stacked_class_bars(
+        ax,
+        pivot,
+        colors_use,
+        ylabel="Number of unique taxa",
+        legend_title=legend_title,
+        font_family=font_family,
+        y_tick_step=y_tick_step,
+        x_label_rotation=x_label_rotation,
     )
-    if legend is not None and legend.get_title() is not None:
-        legend.get_title().set_fontfamily(font_family)
-        legend.get_title().set_fontsize(9)
-
-    fig.subplots_adjust(left=0.12, right=0.98, bottom=0.2, top=0.96)
 
     if return_summary:
         summary_out = pivot.copy()
@@ -3192,6 +3256,128 @@ def plot_edna_records(
 def plot_edna_unique_taxa_stacked(edna_df: pd.DataFrame):
     """Backward-compatible wrapper for legacy eDNA stacked figure calls."""
     return plot_edna_records(edna_df)
+
+
+def normalise_iucn_category(value: object) -> str:
+    """Full IUCN category name; blank statuses become ``Not Evaluated``.
+
+    Accepts abbreviations (``LC``, ``EN``) and any casing of the full names.
+    Unrecognised text is returned stripped but otherwise unchanged.
+    """
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return "Not Evaluated"
+    text = str(value).strip()
+    if text.lower() in {"", "nan", "none", "null", "<na>"}:
+        return "Not Evaluated"
+    return IUCN_CATEGORY_BY_KEY.get(text.lower(), text)
+
+
+def species_by_class_and_iucn(
+    observations: pd.DataFrame,
+    *,
+    species_col: str = "species",
+    class_col: str = "class",
+    iucn_col: str = "iucn_redlist_status",
+) -> pd.DataFrame:
+    """Count unique named species per taxonomic class and IUCN category.
+
+    Each species is counted once; when its records disagree, an assessed
+    status wins over a blank one. Returns columns ``class``, ``iucn``,
+    ``n_species``.
+    """
+    columns = ["class", "iucn", "n_species"]
+    if observations is None or observations.empty or species_col not in observations.columns:
+        return pd.DataFrame(columns=columns)
+    work = pd.DataFrame(
+        {
+            "species": observations[species_col].fillna("").astype(str).str.strip(),
+            "class": (
+                observations[class_col].fillna("").astype(str).str.strip()
+                if class_col in observations.columns
+                else ""
+            ),
+            "iucn": (
+                observations[iucn_col].map(normalise_iucn_category)
+                if iucn_col in observations.columns
+                else "Not Evaluated"
+            ),
+        }
+    )
+    work = work[work["species"] != ""]
+    if work.empty:
+        return pd.DataFrame(columns=columns)
+    work["class"] = work["class"].replace("", "Unknown")
+    work = (
+        work.assign(_unassessed=work["iucn"] == "Not Evaluated")
+        .sort_values("_unassessed", kind="stable")
+        .drop_duplicates("species")
+    )
+    return (
+        work.groupby(["class", "iucn"], as_index=False)
+        .size()
+        .rename(columns={"size": "n_species"})[columns]
+    )
+
+
+def plot_species_by_iucn(
+    observations: pd.DataFrame,
+    *,
+    species_col: str = "species",
+    class_col: str = "class",
+    iucn_col: str = "iucn_redlist_status",
+    legend_title: str = "IUCN Red List status:",
+    font_family: str = "Arial",
+    figsize: tuple[float, float] = (5.2, 3.2),
+    y_tick_step: int | None = None,
+    x_label_rotation: float = 45.0,
+    return_summary: bool = False,
+):
+    """Stacked bars of unique species per class, split by IUCN Red List category.
+
+    Styled to match :func:`plot_edna_records`. Classes are sorted by total
+    species; ``y_tick_step`` defaults to a 1-2-5 step for the tallest bar.
+    When ``return_summary=True``, also returns the class × category pivot.
+    """
+    summary = species_by_class_and_iucn(
+        observations, species_col=species_col, class_col=class_col, iucn_col=iucn_col
+    )
+    fig, ax = plt.subplots(figsize=figsize, facecolor="white")
+    ax.set_facecolor("white")
+
+    if summary.empty:
+        ax.text(0.5, 0.5, "No named species available", ha="center", va="center", transform=ax.transAxes)
+        ax.set_xticks([])
+        ax.set_yticks([])
+        for side in ["top", "right", "left", "bottom"]:
+            ax.spines[side].set_visible(False)
+        if return_summary:
+            return fig, pd.DataFrame()
+        return fig
+
+    present = summary["iucn"].unique().tolist()
+    ordered = [c for c in IUCN_CATEGORY_ORDER if c in present] + [
+        c for c in present if c not in IUCN_CATEGORY_ORDER
+    ]
+    pivot = summary.pivot_table(
+        index="class", columns="iucn", values="n_species", aggfunc="sum", fill_value=0
+    ).reindex(columns=ordered, fill_value=0)
+    pivot = pivot.loc[pivot.sum(axis=1).sort_values(ascending=False).index]
+    pivot.columns.name = None
+
+    step = y_tick_step or _nice_tick_step(float(pivot.sum(axis=1).max()), n_ticks_target=4)
+    _draw_stacked_class_bars(
+        ax,
+        pivot,
+        IUCN_COLOR_MAP,
+        ylabel="Number of species",
+        legend_title=legend_title,
+        font_family=font_family,
+        y_tick_step=step,
+        x_label_rotation=x_label_rotation,
+    )
+    if return_summary:
+        return fig, pivot
+    return fig
 
 def _build_all_device_days(stations_df: pd.DataFrame) -> pd.DataFrame:
     if stations_df.empty or "device_id" not in stations_df.columns:
@@ -3644,6 +3830,16 @@ def _empty_figure(message: str, *, figsize=(8, 8)):
     return fig
 
 
+def figure_group_slug(value: object) -> str:
+    """Lowercase hyphenated id for a figure group, e.g. ``"North Block"`` → ``"north-block"``."""
+    return re.sub(r"[^a-z0-9]+", "-", str(value).strip().lower()).strip("-") or "group"
+
+
+def group_figure_key(group: object, key: str) -> str:
+    """Key under which :func:`save_all_figures` returns a per-group figure."""
+    return f"{figure_group_slug(group)}/{key}"
+
+
 def save_all_figures(
     bundle,
     output_dir: str | Path,
@@ -3654,6 +3850,7 @@ def save_all_figures(
     sensor_types: list[str] | tuple[str, ...] | None = None,
     logo_path: str | Path | None = None,
     filename_prefix: str | None = None,
+    group_col: str | None = None,
 ) -> dict[str, str]:
     """Generate and save project figures using the plotters in this module.
 
@@ -3663,6 +3860,14 @@ def save_all_figures(
 
     When ``filename_prefix`` is set, files are named
     ``{prefix}_{key}.png``; dict keys remain the logical ``key``.
+
+    When ``group_col`` names a column of ``bundle.stations`` (e.g. ``"project"``
+    from :func:`~naturecubepy.analysis.combine_bundles`), sampling maps and
+    deployment timelines are drawn once per group instead of for all stations
+    together. Those figures are keyed by :func:`group_figure_key` and saved as
+    ``{prefix}_{group slug}_{key}.png``. Rows of ``project_boundary`` are
+    matched to groups by the same column when it is present. Species figures
+    always cover the whole bundle.
     """
     selected = set(sensor_types or getattr(bundle, "sensor_types", ("camera", "bioacoustic", "edna")))
     out = Path(output_dir)
@@ -3671,7 +3876,7 @@ def save_all_figures(
     prefix = f"{filename_prefix}_" if filename_prefix else ""
 
     def _path(key: str) -> Path:
-        return out / f"{prefix}{key}.png"
+        return out / f"{prefix}{key.replace('/', '_')}.png"
 
     def _skip(key: str, reason: str) -> None:
         print(f"Warning: {reason}; not writing figure '{key}'.")
@@ -3685,6 +3890,28 @@ def save_all_figures(
         plt.close(fig)
         saved[key] = str(path)
 
+    all_stations = bundle.stations
+    station_groups: list[tuple[str | None, pd.DataFrame]] = [(None, all_stations)]
+    group_boundaries: dict[str | None, object] = {None: project_boundary}
+    if group_col and all_stations is not None and group_col in all_stations.columns:
+        labels = all_stations[group_col].astype(str)
+        station_groups = [
+            (group, all_stations[labels == group])
+            for group in dict.fromkeys(all_stations[group_col].dropna().astype(str))
+        ]
+        boundary = project_boundary
+        if isinstance(boundary, (str, Path)):
+            try:
+                boundary = gpd.read_file(str(boundary))
+            except Exception:
+                boundary = project_boundary  # station_map reports the read error
+        for group, _ in station_groups:
+            if isinstance(boundary, gpd.GeoDataFrame) and group_col in boundary.columns:
+                subset = boundary[boundary[group_col].astype(str) == group]
+                group_boundaries[group] = None if subset.empty else subset
+            else:
+                group_boundaries[group] = boundary
+
     map_specs = [("all_sampling_locations", "all")]
     if "camera" in selected:
         map_specs.append(("camera_sampling_locations", "Camera"))
@@ -3693,44 +3920,50 @@ def save_all_figures(
     if "edna" in selected:
         map_specs.append(("edna_sampling_locations", "eDNA"))
 
-    for key, sensor in map_specs:
-        stations = (
-            bundle.stations
-            if sensor == "all"
-            else _filter_stations_by_sensor(bundle.stations, sensor)
-        )
-        if stations is None or stations.empty:
-            _skip(key, f"no sampling locations for {sensor}")
-            continue
-        try:
-            fig = station_map(
-                stations,
-                measurement_type="all",
-                project_boundary=project_boundary,
-                logo_path=logo_path,
-            )
-        except Exception as exc:
-            _skip(key, f"could not build sampling map for {sensor} ({exc})")
-            continue
-        _save(key, fig)
-
     timeline_specs = []
     if "camera" in selected:
         timeline_specs.append(("timeline_camera_trap_activity", "Camera"))
     if "bioacoustic" in selected:
         timeline_specs.append(("timeline_bioacoustic_activity", "Bioacoustic"))
 
-    for key, sensor in timeline_specs:
-        subset = _filter_stations_by_sensor(bundle.stations, sensor)
-        if subset is None or subset.empty:
-            _skip(key, f"no {sensor} timeline data")
-            continue
-        try:
-            fig, _ = camera_activity_timeline(subset)
-        except Exception as exc:
-            _skip(key, f"could not build {sensor} timeline ({exc})")
-            continue
-        _save(key, fig)
+    for group, group_stations in station_groups:
+        label = "" if group is None else f" in {group}"
+
+        def _key(key: str) -> str:
+            return key if group is None else group_figure_key(group, key)
+
+        for key, sensor in map_specs:
+            stations = (
+                group_stations
+                if sensor == "all"
+                else _filter_stations_by_sensor(group_stations, sensor)
+            )
+            if stations is None or stations.empty:
+                _skip(_key(key), f"no sampling locations for {sensor}{label}")
+                continue
+            try:
+                fig = station_map(
+                    stations,
+                    measurement_type="all",
+                    project_boundary=group_boundaries[group],
+                    logo_path=logo_path,
+                )
+            except Exception as exc:
+                _skip(_key(key), f"could not build sampling map for {sensor}{label} ({exc})")
+                continue
+            _save(_key(key), fig)
+
+        for key, sensor in timeline_specs:
+            subset = _filter_stations_by_sensor(group_stations, sensor)
+            if subset is None or subset.empty:
+                _skip(_key(key), f"no {sensor} timeline data{label}")
+                continue
+            try:
+                fig, _ = camera_activity_timeline(subset)
+            except Exception as exc:
+                _skip(_key(key), f"could not build {sensor} timeline{label} ({exc})")
+                continue
+            _save(_key(key), fig)
 
     method_frames: dict[str, pd.DataFrame] = {}
     if "camera" in selected and bundle.camera is not None and not bundle.camera.empty:
@@ -3832,6 +4065,13 @@ def save_all_figures(
         else:
             _save(key, plot_edna_unique_taxa_stacked(edna_df))
 
+    if "camera" in selected:
+        key = "iucn_species_camera"
+        if species_by_class_and_iucn(bundle.camera).empty:
+            _skip(key, "no named camera species for IUCN figure")
+        else:
+            _save(key, plot_species_by_iucn(bundle.camera))
+
     # Drop stale figures for sensors that are no longer selected / had no data.
     sensor_figure_keys = {
         "camera": (
@@ -3839,6 +4079,7 @@ def save_all_figures(
             "timeline_camera_trap_activity",
             "species_accumulation_mammal_bird_camera",
             "top_mammal_bird_species_camera",
+            "iucn_species_camera",
         ),
         "bioacoustic": (
             "bioacoustic_sampling_locations",
